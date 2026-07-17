@@ -236,6 +236,19 @@ else
     DNS_API_CREDENTIALS=""
 fi
 
+# ─── INSTALL_PATH ───
+echo ""
+info "安装路径设置"
+echo "  指定服务文件的安装目录。配置、证书、数据卷都将存放在此路径下。"
+while true; do
+    read -r -p "  安装路径 [/opt/mynet]: " INSTALL_PATH
+    INSTALL_PATH="${INSTALL_PATH:-/opt/mynet}"
+    if [[ "$INSTALL_PATH" =~ ^/ ]]; then
+        break
+    fi
+    warn "  请输入绝对路径（以 / 开头）"
+done
+
 # ─── 写入 .env ───
 echo ""
 step "写入 .env 文件..."
@@ -256,6 +269,7 @@ MAGIC_DNS_DOMAIN=${MAGIC_DNS_DOMAIN}
 ACME_EMAIL=${ACME_EMAIL:-}
 DNS_API_PROVIDER=${DNS_API_PROVIDER:-}
 DNS_API_CREDENTIALS=${DNS_API_CREDENTIALS:-}
+INSTALL_PATH=${INSTALL_PATH}
 EOF
 
 info ".env 文件已生成"
@@ -274,6 +288,7 @@ echo -e "  数据库:       ${CYAN}${DB_TYPE}${NC}"
 echo -e "  MagicDNS:     ${CYAN}${MAGIC_DNS_DOMAIN}${NC}"
 echo -e "  DERP 端口:    ${CYAN}${DERP_PORT}${NC}"
 echo -e "  STUN 端口:    ${CYAN}${STUN_PORT}${NC}"
+echo -e "  安装路径:     ${CYAN}${INSTALL_PATH}${NC}"
 echo ""
 echo -e "  ${YELLOW}下一步: 运行 ./install.sh 进行部署${NC}"
 echo ""

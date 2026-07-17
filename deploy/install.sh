@@ -18,6 +18,49 @@ check_prereqs() {
     info "Docker $(docker --version | awk '{print $3}' | tr -d ',') / Compose $(docker compose version --short)"
 }
 
+# ─── 准备安装目录 ───
+setup_install_dir() {
+    step "准备安装目录..."
+    local install_dir="${INSTALL_PATH:-/opt/mynet}"
+
+    if [ -d "$install_dir" ] && [ "$(ls -A "$install_dir" 2>/dev/null)" ]; then
+        warn "安装目录 $install_dir 已存在且非空"
+        read -r -p "  是否覆盖？[y/N] " overwrite
+        case "$overwrite" in
+            [yY]|[yY][eE][sS]) info "将覆盖现有文件..." ;;
+            *) error "已取消安装" ;;
+        esac
+    fi
+
+    mkdir -p "$install_dir"/{config,certs,volumes}
+    info "安装目录: $install_dir"
+}
+
+# ─── 复制部署文件到安装目录 ───
+copy_deploy_files() {
+    local install_dir="${INSTALL_PATH:-/opt/mynet}"
+    step "复制部署文件到 $install_dir..."
+
+    # 脚本
+    for script in start.sh shutdown.sh lib.sh; do
+        cp "${SCRIPT_DIR}/${script}" "$install_dir/"
+    done
+    chmod +x "$install_dir"/*.sh
+
+    # Docker Compose 文件
+    cp "${SCRIPT_DIR}/docker-compose.yml" "$install_dir/"
+    cp "${SCRIPT_DIR}/docker-compose.caddy.yml" "$install_dir/"
+    cp "${SCRIPT_DIR}/docker-compose.nocaddy.yml" "$install_dir/"
+
+    # .env 配置
+    cp "${SCRIPT_DIR}/.env" "$install_dir/"
+
+    # ACL 策略文件（无占位符，直接复制）
+    cp "${SCRIPT_DIR}/config/acl.hujson" "$install_dir/config/"
+
+    info "部署文件已复制到 $install_dir"
+}
+
 # ─── 替换配置占位符 ───
 substitute_configs() {
     step "替换配置文件占位符..."
@@ -33,10 +76,11 @@ substitute_configs() {
     info "base_url: ${base_url}  cookie_secure: ${cookie_secure}"
 
     local config_dir="${SCRIPT_DIR}/config"
+    local target_dir="${INSTALL_PATH:-/opt/mynet}/config"
 
     for template_file in "$config_dir"/headscale.yaml.template "$config_dir"/headplane.yaml.template "$config_dir"/derp.yaml.template; do
         [ -f "$template_file" ] || continue
-        local conf_file="${template_file%.template}"
+        local conf_file="${target_dir}/$(basename "${template_file%.template}")"
         info "写入: $(basename "$conf_file")"
         # 从模板复制（确保每次 install 都使用最新 .env 值重新生成）
         cp "$template_file" "$conf_file"
@@ -60,8 +104,9 @@ substitute_configs() {
 # ─── Caddyfile 处理 ───
 prepare_caddyfile() {
     local config_dir="${SCRIPT_DIR}/config"
+    local target_dir="${INSTALL_PATH:-/opt/mynet}/config"
     local template="${config_dir}/Caddyfile.template"
-    local caddyfile="${config_dir}/Caddyfile"
+    local caddyfile="${target_dir}/Caddyfile"
 
     if [ "${USE_CADDY:-true}" != "true" ]; then
         info "未使用 Caddy，跳过 Caddyfile 准备"
@@ -119,7 +164,7 @@ import_images() {
 # ─── 单个域名的自签名证书 ───
 _generate_self_signed() {
     local domain="$1"
-    local certs_dir="${SCRIPT_DIR}/certs"
+    local certs_dir="${INSTALL_PATH:-/opt/mynet}/certs"
     local cert_file="${certs_dir}/${domain}.crt"
     local key_file="${certs_dir}/${domain}.key"
     local fullchain_file="${certs_dir}/${domain}.fullchain.pem"
@@ -152,7 +197,7 @@ _generate_self_signed() {
 generate_self_signed_certs() {
     step "生成 DERP 自签名证书..."
     local derp_domain="${DERP_DOMAIN:-${DOMAIN}}"
-    mkdir -p "${SCRIPT_DIR}/certs"
+    mkdir -p "${INSTALL_PATH:-/opt/mynet}/certs"
     _generate_self_signed "$derp_domain"
 
     # 如果 DERP 使用独立域名，也为主域名生成证书（Caddy 在不使用 HTTPS 时不需要，但保留以防后续使用）
@@ -185,7 +230,7 @@ _detect_webroot() {
 # 为单个域名签发证书（acme.sh）
 _issue_cert() {
     local domain="$1"
-    local certs_dir="${SCRIPT_DIR}/certs"
+    local certs_dir="${INSTALL_PATH:-/opt/mynet}/certs"
     local acme_sh="$HOME/.acme.sh/acme.sh"
     local cert_file="${certs_dir}/${domain}.crt"
 
@@ -301,7 +346,7 @@ _issue_cert() {
 
 setup_certs() {
     step "检查 TLS 证书..."
-    local certs_dir="${SCRIPT_DIR}/certs"
+    local certs_dir="${INSTALL_PATH:-/opt/mynet}/certs"
     local acme_sh="$HOME/.acme.sh/acme.sh"
     local derp_domain="${DERP_DOMAIN:-${DOMAIN}}"
 
@@ -350,27 +395,33 @@ handle_certs() {
 case "${1:-}" in
     renew-certs)
         load_config
+        local install_dir="${INSTALL_PATH:-/opt/mynet}"
         if [ "${CERT_MODE:-auto}" = "manual" ]; then
             warn "证书模式为 manual，无需续期。"
-            info "如需重新生成自签名证书，请删除 certs/ 目录后重新运行 ./install.sh"
+            info "如需重新生成自签名证书，请删除 ${install_dir}/certs/ 目录后重新运行 ./install.sh"
             exit 0
         fi
+        # 确保证书签发到安装目录
         setup_certs
-        info "证书已续期，运行 ./start.sh 重启服务使其生效"
+        info "证书已续期，运行 cd ${install_dir} && ./start.sh 重启服务使其生效"
         ;;
     *)
         check_prereqs
         load_config
+        setup_install_dir
+        copy_deploy_files
         substitute_configs
         prepare_caddyfile
         import_images
         handle_certs
+        local install_dir="${INSTALL_PATH:-/opt/mynet}"
         echo ""
         echo -e "${GREEN}══════════════════════════════════════════${NC}"
         echo -e "${GREEN}  部署完成！${NC}"
         echo -e "${GREEN}══════════════════════════════════════════${NC}"
         echo ""
-        echo -e "  ${YELLOW}下一步: 运行 ./start.sh 启动服务${NC}"
+        echo -e "  安装路径:   ${CYAN}${install_dir}${NC}"
+        echo -e "  ${YELLOW}下一步: cd ${install_dir} && ./start.sh${NC}"
         if [ "${USE_CADDY:-true}" = "true" ]; then
             echo -e "  Caddy:       ${GREEN}✓ 已启用${NC} (证书: ${CERT_MODE:-auto})"
         else
