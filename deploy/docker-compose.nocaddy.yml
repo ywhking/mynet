@@ -1,0 +1,12 @@
+# Mynet — 直连模式 (不使用 Caddy 反向代理)
+# 与 docker-compose.yml 配合使用，直接暴露 Headscale 和 Headplane 端口。
+# 自动加载 ./start.sh 选择。
+
+services:
+  headscale:
+    ports:
+      - "${HEADSCALE_PORT:-8080}:8080"
+
+  headplane:
+    ports:
+      - "${HEADPLANE_PORT:-3000}:3000"

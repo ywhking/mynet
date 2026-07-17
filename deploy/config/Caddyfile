@@ -1,0 +1,38 @@
+# Caddyfile — Mynet 反向代理
+# __LISTEN__ 由 install.sh 根据 CERT_MODE 替换:
+#   auto   → {$DOMAIN:localhost}     (Caddy 自动 HTTPS)
+#   manual → {$DOMAIN:localhost}:80  (仅 HTTP)
+__LISTEN__ {
+	# --- 首页重定向到 /admin/ ---
+	redir / /admin/ 302
+
+	# --- Headplane Web UI ---
+	handle /admin/* {
+		reverse_proxy headplane:3000 {
+			flush_interval -1
+		}
+	}
+
+	# --- Headscale gRPC ---
+	handle /grpc/* {
+		reverse_proxy h2c://headscale:9090
+	}
+
+	# --- Headscale (默认) ---
+	# 控制协议: /key, /ts2021, /machine/*, /api/* 等
+	handle {
+		reverse_proxy headscale:8080
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		-X-Powered-By
+	}
+
+	log {
+		output stdout
+		format json
+	}
+}

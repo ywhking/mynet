@@ -1,0 +1,31 @@
+# Mynet — Caddy 反向代理 (TLS 模式)
+# 与 docker-compose.yml 配合使用，添加 Caddy 作为 TLS 终止和反向代理。
+# 自动加载 ./start.sh 选择。
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    container_name: mynet-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    networks:
+      - mynet
+    volumes:
+      - ./config/Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./certs:/certs:ro
+      - caddy_data:/data
+    environment:
+      DOMAIN: "${DOMAIN}"
+    healthcheck:
+      test: ["CMD", "caddy", "version"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    depends_on:
+      - headplane
+      - headscale
+
+volumes:
+  caddy_data:

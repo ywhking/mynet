@@ -1,0 +1,109 @@
+# Mynet — 公网部署 Docker Compose (基础服务)
+# 所有服务运行在内部网络 "mynet"。
+#
+# 使用方式:
+#   默认（Caddy 代理）: docker compose -f docker-compose.yml -f docker-compose.caddy.yml up -d
+#   无代理（直连）:     docker compose -f docker-compose.yml -f docker-compose.nocaddy.yml up -d
+#
+# 推荐使用 ./start.sh 启动，它会自动选择合适的 compose 文件。
+
+services:
+  # ============================================================
+  # Headscale — 控制服务器
+  # ============================================================
+  headscale:
+    image: mynet/headscale:v1
+    container_name: mynet-headscale
+    restart: unless-stopped
+    command: serve
+    # distroless 以 nonroot (65532) 运行，需要 root 才能写入 Docker volume
+    user: "0:0"
+    networks:
+      - mynet
+    volumes:
+      - ./config/headscale.yaml:/etc/headscale/config.yaml:ro
+      - ./config/derp.yaml:/etc/headscale/derp.yaml:ro
+      - ./config/acl.hujson:/etc/headscale/acl.hujson:ro
+      - headscale_data:/var/lib/headscale
+    environment:
+      DOMAIN: "${DOMAIN}"
+      DB_TYPE: "${DB_TYPE:-sqlite3}"
+      MAGIC_DNS_DOMAIN: "${MAGIC_DNS_DOMAIN:-vpn}"
+      DERP_PORT: "${DERP_PORT:-3340}"
+      STUN_PORT: "${STUN_PORT:-3478}"
+    healthcheck:
+      test: ["CMD", "/ko-app/headscale", "health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ============================================================
+  # Headplane — Web 管理界面
+  # ============================================================
+  headplane:
+    image: mynet/headplane:v1
+    container_name: mynet-headplane
+    restart: unless-stopped
+    networks:
+      - mynet
+    volumes:
+      - ./config/headplane.yaml:/etc/headplane/config.yaml:ro
+      - ./config/headscale.yaml:/etc/headscale/config.yaml:ro
+      - headplane_data:/var/lib/headplane
+    environment:
+      DOMAIN: "${DOMAIN}"
+      HEADPLANE_COOKIE_SECRET: "${COOKIE_SECRET}"
+      HEADPLANE_HEADSCALE__API_KEY: "${HEADSCALE_API_KEY:-}"
+      HEADPLANE_HEADSCALE__CONFIG_PATH: "/etc/headscale/config.yaml"
+      # OIDC（可选 — 如需启用，取消注释并填入实际值）：
+      # HEADPLANE_OIDC__ISSUER: "${OIDC_ISSUER}"
+      # HEADPLANE_OIDC__CLIENT_ID: "${OIDC_CLIENT_ID}"
+      # HEADPLANE_OIDC__CLIENT_SECRET: "${OIDC_CLIENT_SECRET}"
+    depends_on:
+      - headscale
+
+  # ============================================================
+  # DERP — 中继服务器 (TLS 生产模式)
+  # ============================================================
+  derper:
+    image: mynet/derper:v1
+    container_name: mynet-derper
+    restart: unless-stopped
+    ports:
+      - "${DERP_PORT:-3340}:3340"
+      - "${STUN_PORT:-3478}:3478/udp"
+    networks:
+      - mynet
+    volumes:
+      - ./certs:/certs:ro
+      - derper_data:/var/lib/derper
+    environment:
+      DERP_CERTMODE: "manual"
+      DERP_CERTDIR: "/certs"
+      DERP_HOSTNAME: "${DERP_DOMAIN:-${DOMAIN}}"
+      DERP_ADDR: ":3340"
+      DERP_STUN_PORT: "${STUN_PORT:-3478}"
+      DERP_HOME: "blank"
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "3340"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+# ============================================================
+# 网络
+# ============================================================
+networks:
+  mynet:
+    name: mynet
+    internal: false  # Caddy + DERP 需要对外通信
+
+# ============================================================
+# 卷
+# ============================================================
+volumes:
+  headscale_data:
+  headplane_data:
+  derper_data:

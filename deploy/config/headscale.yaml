@@ -1,0 +1,61 @@
+---
+# Headscale 生产配置 — Mynet 公网部署
+
+# === 客户端连接地址 ===
+# 客户端通过此地址与控制服务器通信。
+# Caddy 在 443 端口反向代理到 headscale:8080
+server_url: __BASE_URL__
+
+# 监听地址（仅内部网络访问，Caddy 反向代理在前面）
+listen_addr: 0.0.0.0:8080
+
+# Unix socket — 供 CLI 工具本地连接
+unix_socket: /var/lib/headscale/headscale.sock
+
+# Metrics — 仅绑定本地（由 headplane 内部消费或通过反向代理保护）
+metrics_listen_addr: 127.0.0.1:9090
+
+# === 噪声协议私钥 ===
+noise:
+  private_key_path: /var/lib/headscale/noise_private.key
+
+# === IP 分配 ===
+prefixes:
+  v4: 100.64.0.0/10
+  v6: fd7a:115c:a1e0::/48
+  allocation: sequential
+
+# === DERP 中继 ===
+derp:
+  server:
+    enabled: false
+  urls: []
+  paths:
+    - /etc/headscale/derp.yaml
+
+# === 数据库 ===
+database:
+  type: sqlite3
+  sqlite:
+    path: /var/lib/headscale/db.sqlite
+
+# === DNS / MagicDNS ===
+# MagicDNS 启用后，节点可通过 <hostname>.<MAGIC_DNS_DOMAIN> 互相访问
+dns:
+  magic_dns: true
+  base_domain: __MAGIC_DNS_DOMAIN__
+  override_local_dns: false
+  # 上游 DNS（MagicDNS 未命中时使用）
+  nameservers:
+    global:
+      - 1.1.1.1
+      - 8.8.8.8
+
+# === ACL 策略 ===
+policy:
+  path: /etc/headscale/acl.hujson
+
+# === 日志 ===
+log:
+  level: info
+  format: json

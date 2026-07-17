@@ -1,0 +1,27 @@
+# Headplane 配置 — Mynet 公网部署
+
+server:
+  host: "0.0.0.0"
+  port: 3000
+  base_url: "__BASE_URL__"
+  data_path: "/var/lib/headplane"
+  cookie_secret: "__COOKIE_SECRET__"
+  cookie_secure: __COOKIE_SECURE__
+
+# Headscale API 连接（内部 Docker 网络，无需 TLS）
+headscale:
+  url: "http://headscale:8080"
+  config_path: "/etc/headscale/config.yaml"
+  api_key: ""
+
+# 集成配置
+integration:
+  agent:
+    enabled: true
+  docker:
+    enabled: false
+  kubernetes:
+    enabled: false
+    pod_name: ""
+  proc:
+    enabled: false

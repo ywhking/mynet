@@ -1,0 +1,21 @@
+# DERP map — Mynet 公网部署
+# 定义本地 DERP 中继服务器，由 headscale 分发给所有客户端。
+#
+# Region IDs 900+ 保留给自定义 DERP 服务器，避免与 Tailscale 官方区域冲突。
+
+regions:
+  900:
+    regionid: 900
+    regioncode: mynet-derp
+    regionname: Mynet DERP
+    nodes:
+      - name: 900a
+        regionid: 900
+        # DERP 服务器公网地址 — 客户端通过此地址连接
+        hostname: __DERP_DOMAIN__
+        # DERP 中继端口（TLS — 生产环境必须使用有效证书）
+        derpport: 3340
+        # STUN 端口（NAT 穿透）
+        stunport: 3478
+        # 该节点也响应 HTTP 端口上的 HTTP 质询
+        canport80: false

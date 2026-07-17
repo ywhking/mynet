@@ -1,0 +1,29 @@
+{
+  "groups": {
+    "group:admin": ["admin@example.com"]
+  },
+
+  "hosts": {
+    "vpn": "100.64.0.0/10"
+  },
+
+  "acls": [
+    {
+      "action": "accept",
+      "src":    ["group:admin"],
+      "dst":    ["*:*"]
+    },
+    {
+      "action": "accept",
+      "src":    ["autogroup:member"],
+      "dst":    ["autogroup:member:*"]
+    }
+  ],
+
+  "autoApprovers": {
+    "routes": {
+      "0.0.0.0/0":    ["group:admin"],
+      "::/0":          ["group:admin"]
+    }
+  }
+}
