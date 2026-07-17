@@ -7,6 +7,9 @@ certs/
 # 运行时数据
 volumes/
 
+# 构建产物（Docker 镜像 tar 包）
+images/
+
 # 生成的配置文件（从 .template 生成）
 config/headscale.yaml
 config/headplane.yaml
