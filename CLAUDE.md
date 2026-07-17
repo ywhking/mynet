@@ -28,6 +28,9 @@ Three deployment modes (controlled by `.env` vars):
 ## Directory structure
 
 ```
+build.sh                                 — Build container images from submodule sources → deploy/images/
+headscale/  headplane/  tailscale/       — Git submodules (source code, dev branch)
+
 deploy/
   config.sh / install.sh / start.sh / shutdown.sh   — Deployment lifecycle scripts
   lib.sh                                             — Shared shell utilities (logging, compose_args helper)
@@ -47,6 +50,15 @@ tests/
 ```
 
 ## Common commands
+
+### Build (run from repo root)
+
+```bash
+./build.sh              # Build all three images → deploy/images/
+./build.sh headscale    # Headscale control server only
+./build.sh derper       # DERP relay server only
+./build.sh headplane    # Headplane Web UI only
+```
 
 ### Deployment (run from `deploy/`)
 

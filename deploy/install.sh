@@ -34,9 +34,12 @@ substitute_configs() {
 
     local config_dir="${SCRIPT_DIR}/config"
 
-    for conf_file in "$config_dir"/headscale.yaml "$config_dir"/headplane.yaml "$config_dir"/derp.yaml; do
-        [ -f "$conf_file" ] || continue
+    for template_file in "$config_dir"/headscale.yaml.template "$config_dir"/headplane.yaml.template "$config_dir"/derp.yaml.template; do
+        [ -f "$template_file" ] || continue
+        local conf_file="${template_file%.template}"
         info "写入: $(basename "$conf_file")"
+        # 从模板复制（确保每次 install 都使用最新 .env 值重新生成）
+        cp "$template_file" "$conf_file"
         sed -i \
             -e "s|__DOMAIN__|${DOMAIN}|g" \
             -e "s|__DERP_DOMAIN__|${DERP_DOMAIN:-${DOMAIN}}|g" \
@@ -57,6 +60,7 @@ substitute_configs() {
 # ─── Caddyfile 处理 ───
 prepare_caddyfile() {
     local config_dir="${SCRIPT_DIR}/config"
+    local template="${config_dir}/Caddyfile.template"
     local caddyfile="${config_dir}/Caddyfile"
 
     if [ "${USE_CADDY:-true}" != "true" ]; then
@@ -75,6 +79,8 @@ prepare_caddyfile() {
         listen_addr="{\$DOMAIN:localhost}:80"
     fi
 
+    # 从模板复制后替换（确保每次 install 都使用最新配置）
+    cp "$template" "$caddyfile"
     sed -i "s|__LISTEN__|${listen_addr}|" "$caddyfile"
     info "Caddyfile 已就绪"
 }
@@ -200,6 +206,21 @@ _issue_cert() {
         fi
     fi
 
+    # 检查 acme.sh 内部存储是否已有该域名证书（如已签发过则直接导出，无需重新走 --issue 流程）
+    local acme_cert_dir="${HOME}/.acme.sh/${domain}_ecc"
+    local acme_cert_dir_rsa="${HOME}/.acme.sh/${domain}"
+    if [ -d "$acme_cert_dir" ] || [ -d "$acme_cert_dir_rsa" ]; then
+        info "  ${domain}: acme.sh 已有证书，直接导出到 certs/..."
+        "$acme_sh" --install-cert -d "$domain" \
+            --key-file       "${certs_dir}/${domain}.key" \
+            --fullchain-file "${certs_dir}/${domain}.fullchain.pem"
+        cp "${certs_dir}/${domain}.fullchain.pem" "$cert_file"
+        if [ -f "${certs_dir}/${domain}.key" ]; then
+            return 0
+        fi
+        warn "  ${domain}: 导出失败，尝试重新签发..."
+    fi
+
     info "  签发证书: ${domain}"
 
     if [ -n "${DNS_API_PROVIDER:-}" ] && [ -n "${DNS_API_CREDENTIALS:-}" ]; then
@@ -257,6 +278,14 @@ _issue_cert() {
     fi
 
     if [ ! -f "${certs_dir}/${domain}.fullchain.pem" ]; then
+        # acme.sh 可能因"证书已签发过"而跳过了签发，尝试从 acme.sh 内部存储安装已有证书
+        info "  ${domain}: 尝试从 acme.sh 内部存储安装已有证书..."
+        "$acme_sh" --install-cert -d "$domain" \
+            --key-file       "${certs_dir}/${domain}.key" \
+            --fullchain-file "${certs_dir}/${domain}.fullchain.pem"
+    fi
+
+    if [ ! -f "${certs_dir}/${domain}.fullchain.pem" ]; then
         error "证书签发失败 (${domain})。请检查：\n" \
               "  1. 域名 DNS 是否正确解析到本机\n" \
               "  2. 80 端口是否在安全组/防火墙中开放\n" \
@@ -300,10 +329,8 @@ setup_certs() {
     # 签发主域名证书（Caddy 使用）
     _issue_cert "$DOMAIN"
 
-    # 如果 DERP 使用独立域名，也签发 DERP 证书
-    if [ "$derp_domain" != "$DOMAIN" ]; then
-        _issue_cert "$derp_domain"
-    fi
+    # 签发 DERP 证书（始终执行，与主域名相同时快速跳过）
+    _issue_cert "$derp_domain"
 
     info "TLS 证书签发成功"
 }
