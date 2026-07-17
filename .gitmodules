@@ -1,0 +1,12 @@
+[submodule "headscale"]
+	path = headscale
+	url = https://github.com/ywhking/headscale.git
+	branch = dev
+[submodule "headplane"]
+	path = headplane
+	url = https://github.com/ywhking/headplane.git
+	branch = dev
+[submodule "tailscale"]
+	path = tailscale
+	url = https://github.com/ywhking/tailscale.git
+	branch = dev
