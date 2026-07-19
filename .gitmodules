@@ -10,3 +10,7 @@
 	path = tailscale
 	url = https://github.com/ywhking/tailscale.git
 	branch = dev
+[submodule "tailscale-wincli"]
+	path = tailscale-wincli
+	url = https://github.com/ywhking/tailscale-client.git
+	branch = dev
