@@ -1,0 +1,36 @@
+# ============================================================
+# Input Parameters (输入参数)
+# ============================================================
+# Copy this file to terraform.tfvars and modify values as needed.
+
+# 1. 地域 (Alibaba Cloud region) — 必填
+alicloud_region = "cn-wulanchabu"
+
+# 2. VPC IPv4 地址范围 (CIDR block for the VPC) — 可选，默认 172.16.0.0/16
+vpc_cidr = "172.16.0.0/16"
+
+# 3. 资源组名称 (Resource group name) — 必填
+resource_group_name = "tf-resource-group"
+
+# 4. ECS 实例列表 — 必填
+#    map key = ECS 实例名称
+#    public_ip 必须且只能有一个为 true（有公网 IP 的实例）
+#    密钥对名称自动生成为 "KEY-<实例名称>"
+ecs_instances = {
+  "tf-ecs-public" = {
+    host_name = "public"
+    public_ip = true
+  }
+  "tf-ecs-private" = {
+    host_name = "private"
+    public_ip = false
+  }
+}
+
+# --- 以下为可选参数 ---
+
+# 5. SSH 公钥内容（可选，留空则通过 generate_key.sh 本地自动生成）
+# ecs_ssh_public_key = "ssh-rsa AAAAB3NzaC1yc2E..."
+
+# 6. ECS 实例类型（可选，默认 ecs.t6-c1m2.large）
+# ecs_instance_type = "ecs.t6-c1m2.large"

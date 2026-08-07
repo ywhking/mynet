@@ -1,0 +1,13 @@
+---
+# 全局 Ansible 变量（可选覆盖）
+# 这些变量由 Terraform inventory 脚本自动设置，通常不需要手动修改。
+#
+# 如需覆盖，取消注释并修改对应值：
+#
+# ansible_user: root
+# vpc_cidr: "172.16.0.0/16"
+#
+# NAT 网关配置参数:
+# nat_snat_mode: "2"           # 1=SNAT, 2=MASQUERADE
+# nat_clear_rules: "y"         # y=清空现有规则, n=保留
+# nat_configure_dnat: "n"      # y=配置端口转发, n=跳过
