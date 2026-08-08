@@ -8,8 +8,8 @@ This is a Terraform project that provisions Alibaba Cloud (Alicloud) resources:
 
 - **Resource Group** (`rg.tf`) — Resource group via `alicloud_resource_manager_resource_group`, name from input parameter.
 - **Provider** (`main.tf`) — Alicloud provider, `alicloud_region` (地域) required.
-- **VPC** (`vpc.tf`) — VPC, one VSwitch, security group (SSH/HTTP/HTTPS/ICMP ingress rules), route entry for NAT traffic forwarding, and source/dest check disable on the bastion ENI.
-- **ECS** (`ecs.tf`) — Dynamic N instances (Ubuntu 24.04 via `data.alicloud_images`), exactly one with public IP (10Mbps). SSH key pairs auto-generated locally via `data.external` calling `scripts/generate_key.sh`, one key pair per ECS.
+- **VPC** (`vpc.tf`) — VPC, two VSwitches (public subnet `public_devices.cidr` for 公网设备, internal subnet `internal_devices.cidr` for 内网设备), security group (SSH/HTTP/HTTPS/ICMP ingress rules), **内网子网独立路由表**（`0.0.0.0/0` → 堡垒机 ENI 做 NAT 转发，公网子网保持默认路由表直连互联网网关），and source/dest check disable on the bastion ENI. Subnets can reach each other via the VPC's built-in local route.
+- **ECS** (`ecs.tf`) — Dynamic N instances (Ubuntu 24.04 via `data.alicloud_images`), placed in the public or internal subnet by group, with `public_ip = true` devices getting a public IP (10Mbps). Exactly one `is_bastion = true` device (must have `public_ip = true`) acts as the NAT gateway. SSH key pairs auto-generated locally via `data.external` calling `scripts/generate_key.sh`, one key pair per ECS.
 
 ## Scripts
 
@@ -27,34 +27,52 @@ The `scripts/` directory contains shell scripts used by Terraform and Ansible:
 |------|------|--------|
 | `alicloud_region` | 地域 | `cn-wulanchabu` |
 | `resource_group_name` | 资源组名称 | `tf-resource-group` |
-| `ecs_instances` | ECS 实例列表（map），key 为实例名称，`public_ip` 必须且只能有一个为 `true` | 见下方示例 |
+| `public_devices` | 公网设备配置（公网子网 IP 地址段 + ECS 实例列表，含 `host_name` / `public_ip` / `is_bastion`） | 见下方示例 |
+| `internal_devices` | 内网设备配置（内网子网 IP 地址段 + ECS 实例列表，含 `host_name`） | 见下方示例 |
 
 ## Optional Input Parameters
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
-| `vpc_cidr` | VPC IPv4 地址范围 | `172.16.0.0/16` |
-| `vswitch_zone` | VSwitch 可用区 | `cn-wulanchabu-a` |
+| `vpc_cidr` | VPC IPv4 地址范围（前缀长度须 ≤ 16，才能容纳两个 /24 子网） | `172.16.0.0/16` |
+| `vswitch_zone` | VSwitch 可用区（同时应用于公网/内网两个子网） | `cn-wulanchabu-a` |
 | `sg_name` | 安全组名称 | `tf-sg-default` |
 | `ecs_instance_type` | ECS 实例类型 | `ecs.t6-c1m2.large` |
 | `ecs_ssh_public_key` | SSH 公钥内容（留空则本地自动生成） | `""` |
 
-### `ecs_instances` 格式示例
+### `public_devices` / `internal_devices` 格式示例
 
 ```hcl
-ecs_instances = {
-  "web-server" = {
-    host_name = "web"
-    public_ip = true   # 有且只能有一个为 true
+# 公网设备（公网子网）— 有且仅有一个 is_bastion = true，且该实例必须 public_ip = true
+public_devices = {
+  cidr = "172.16.0.0/24"
+  instances = {
+    "web-server" = {
+      host_name  = "web"
+      public_ip  = true    # 是否有公网 IP
+      is_bastion = false   # 是否堡垒机（NAT 网关）
+    }
+    "bastion" = {
+      host_name  = "bastion"
+      public_ip  = true
+      is_bastion = true
+    }
   }
-  "db-server" = {
-    host_name = "db"
-    public_ip = false
+}
+
+# 内网设备（内网子网）— 实例无公网 IP，外网流量经堡垒机 NAT 转发
+internal_devices = {
+  cidr = "172.16.1.0/24"
+  instances = {
+    "db-server" = {
+      host_name = "db"
+    }
   }
 }
 ```
 
 密钥对名称自动生成为 `KEY-<实例名称>`，每个 ECS 独立一个密钥对。
+子网 CIDR 必须位于 `vpc_cidr` 内且互不重叠（由 `check "subnet_ranges"` 校验）。
 
 Copy `terraform.tfvars.example` to `terraform.tfvars` and fill in values:
 
@@ -80,12 +98,14 @@ After setting them, run `terraform plan` / `terraform apply` as normal.
 | Output | Description |
 |--------|-------------|
 | `ecs_key_pair_names` | SSH key pair names (keyed by instance name) |
-| `ecs_public_ips` | Public IPs of the bastion ECS |
+| `ecs_public_ips` | Public IPs of all `public_ip = true` instances (keyed by instance name) |
 | `ecs_private_ips` | Private IPs of all ECS instances |
-| `bastion_name` | Name of the bastion (NAT gateway) ECS |
+| `bastion_name` | Name of the bastion (NAT gateway) ECS (`is_bastion = true`) |
 | `bastion_public_ip` | Public IP of the bastion ECS |
 | `bastion_private_ip` | Private IP of the bastion ECS |
 | `vpc_cidr` | VPC CIDR block |
+| `vswitch_public_cidr` | Public subnet VSwitch CIDR block (`public_devices.cidr`) |
+| `vswitch_internal_cidr` | Internal subnet VSwitch CIDR block (`internal_devices.cidr`) |
 
 ## Commands
 
@@ -119,7 +139,7 @@ Ansible 用于在 Terraform 创建的 ECS 实例上自动配置 NAT 网关和路
 ansible/
 ├── ansible.cfg                          # Ansible 配置（默认 inventory 指向 hosts.yml、SSH 跳板等）
 ├── inventory/
-│   ├── generate_inventory.sh            # inventory 脚本（--list 动态输出 / --write 生成静态 hosts.yml）
+│   ├── generate_inventory.sh            # inventory 脚本（nat_gateway/public/internal 三组；--list 动态输出 / --write 生成静态 hosts.yml）
 │   └── hosts.yml                        # 静态 inventory（自动生成，请勿手动编辑）
 ├── playbooks/
 │   └── setup-all.yml                    # 主 playbook：NAT 网关 + 内部 ECS 网关配置
@@ -166,7 +186,10 @@ ansible-playbook playbooks/setup-all.yml --tags client
 
 > **注意**：`terraform apply` / `terraform destroy` 之后，必须重新执行
 > `./inventory/generate_inventory.sh --write` 刷新静态 inventory，
-> 否则 IP 和主机列表会过期。
+> 否则 IP 和主机列表会过期。特别是堡垒机（`is_bastion=true`）因
+> `vswitch_id` 是 ForceNew 属性，迁移子网时会**销毁重建，公网/私网 IP
+> 全部变化**——apply 后必须重跑 inventory 生成和 `setup-all.yml`
+>（内部机默认路由需更新到新堡垒机 IP，否则断网）。
 
 ### Playbook 执行流程
 
@@ -198,7 +221,7 @@ Play 3: all 组
 |------|------|
 | **MASQUERADE** | 云环境中公网 IP 由云平台动态 NAT 映射，适合用 MASQUERADE 而非固定 SNAT |
 | **单网卡 NAT** | 阿里云 VPC 中 ECS 只有一个 ENI，入站/出站流量都在 eth0 上 |
-| **Netplan 持久化** | Ubuntu 24.04 使用 Netplan 管理网络，路由配置写入 `/etc/netplan/99-nat-gateway-route.yaml` |
+| **Netplan 持久化** | Ubuntu 24.04 使用 Netplan 管理网络，路由配置写入 `/etc/netplan/99-nat-gateway-route.yaml`（metric 50，低于云初始化 DHCP 默认路由的 100，重启后默认路由确定走 NAT 网关） |
 | **动态解析 + 静态固化** | `generate_inventory.sh` 从 `terraform output -json` 解析 IP 和密钥路径；`--write` 固化为 `hosts.yml`，Ansible 走静态 inventory（命令无需 `-i`），资源变更后重新生成即可 |
 
 ### 回滚
@@ -216,9 +239,9 @@ ssh -J root@<bastion-public-ip> root@<internal-ecs-ip> \
 
 - **Provider**: Alicloud (`hashicorp/alicloud`, pinned to `1.285.0` in `.terraform.lock.hcl`)
 - **Multi-file configuration**: Provider in `main.tf`, VPC in `vpc.tf`, ECS in `ecs.tf`, Resource Group in `rg.tf`.
-- **Required variables** (`alicloud_region`, `resource_group_name`, `ecs_instances`) have no defaults — must be set via `.tfvars` or `-var`.
+- **Required variables** (`alicloud_region`, `resource_group_name`, `public_devices`, `internal_devices`) have no defaults — must be set via `.tfvars` or `-var`.
 - **Other variables** have defaults — override via `.tfvars` or `-var` CLI flags.
-- **External dependencies**: The `null_resource.disable_src_dst_check` in `vpc.tf` requires the `aliyun` CLI to be installed and authenticated.
+- **No external CLI dependencies**: 关闭堡垒机源/目的检查由 provider 原生 `source_dest_check` 参数完成（内部调用 `ModifyNetworkInterfaceAttribute`），无需安装 aliyun CLI。
 
 ### Resource Graph
 
@@ -233,23 +256,31 @@ alicloud_resource_manager_resource_group.rg │
   │                                         │
   ├─→ alicloud_vpc.vpc                      │
   │     │                                   │
-  │     ├─→ alicloud_vswitch.vswitch ──→ alicloud_instance.ecs["<name>"]  (N 台动态，for_each)
-  │     │                                                               │
+  │     ├─→ alicloud_vswitch.public   (public_devices.cidr，公网设备) ──→ alicloud_instance.ecs["<name>"]
+  │     │                                                         (group = "public"；public_ip 必须 = true，
+  │     │                                                          is_bastion = true 的为堡垒机)
+  │     ├─→ alicloud_vswitch.internal (internal_devices.cidr，内网设备) ──→ alicloud_instance.ecs["<name>"]
+  │     │                                                         (group = "internal"；无公网 IP)
+  │     │
   │     ├─→ alicloud_security_group.sg ──→ allow_ssh / allow_http / allow_https / allow_icmp
   │     │
-  │     ├─→ alicloud_route_entry.nat_gateway  (0.0.0.0/0 → 堡垒机 ENI)
-  │     │     │
-  │     │     └─→ local.bastion_eni_id  (from alicloud_instance.ecs[bastion].network_interface_id)
+  │     ├─→ alicloud_route_table.internal (内网子网独立路由表)
+  │     │     ├─→ alicloud_route_table_attachment.internal (绑定内网 vswitch)
+  │     │     └─→ alicloud_route_entry.nat_gateway  (0.0.0.0/0 → 堡垒机 ENI)
+  │     │           │
+  │     │           └─→ local.bastion_eni_id  (from alicloud_instance.ecs[bastion].network_interface_id)
   │     │
-  │     └─→ null_resource.disable_src_dst_check  (aliyun CLI: 关闭堡垒机源/目的检查)
+  │     └─→ alicloud_instance.ecs[bastion]  (source_dest_check = false，provider 原生关闭源/目的检查)
   │
   └─ (all resources use resource_group_id to reference this group)
 ```
 
 **Key architectural details:**
 
-- **VPC route entry**: Alibaba Cloud VPC virtual switches perform L3 forced routing for destinations outside the VPC CIDR. The `alicloud_route_entry.nat_gateway` routes `0.0.0.0/0` to the bastion's ENI so internal ECS traffic reaches the bastion for NAT forwarding.
-- **Source/dest check**: Alibaba Cloud ECS instances have source/destination checking enabled by default (drops packets not destined for the instance's own IP). The `null_resource.disable_src_dst_check` uses the `aliyun` CLI to disable this on the bastion ENI, allowing it to forward traffic from internal ECS instances.
+- **Two subnets (public/internal)**: `alicloud_vswitch.public` 使用 `public_devices.cidr`（默认 `172.16.0.0/24`）放置公网设备，`alicloud_vswitch.internal` 使用 `internal_devices.cidr`（默认 `172.16.1.0/24`）放置内网设备。`ecs.tf` 中的 `local.all_instances` 将两组实例合并归一化（`host_name` / `public_ip` / `is_bastion` / `group` 字段），ECS 通过 `each.value.group == "public" ? alicloud_vswitch.public.id : alicloud_vswitch.internal.id` 选择子网。
+- **Cross-subnet connectivity**: 同一 VPC 内不同 VSwitch 之间由路由表的 local 系统路由（VPC CIDR）保证互通，最长前缀匹配优先于 `0.0.0.0/0` 路由条目，无需额外路由或安全组配置。
+- **Per-subnet routing (NAT via bastion)**: 阿里云 VPC 虚拟交换机会对非 VPC CIDR 目的 IP 执行 L3 强制路由。**内网子网**挂独立路由表（`alicloud_route_table.internal` + `alicloud_route_table_attachment.internal`），`alicloud_route_entry.nat_gateway` 将 `0.0.0.0/0` 指向堡垒机 ENI，内网设备外网流量送达堡垒机做 NAT 转发。**公网子网**保持默认路由表直连互联网网关——所有设备（validation 强制 `public_ip = true`，需求 T5）入站/出站都正常。公网子网不再允许无公网 IP 的设备；如需无公网 IP 的实例，请放入内网子网。
+- **Source/dest check**: Alibaba Cloud ECS instances have source/destination checking enabled by default (drops packets not destined for the instance's own IP). `ecs.tf` 中为堡垒机实例设置 `source_dest_check = false`（非堡垒机实例不设置，保持云上默认值），由 provider 原生调用 `ModifyNetworkInterfaceAttribute` 完成，允许堡垒机转发内网 ECS 的流量——无需外部 aliyun CLI。注意该属性为 ForceNew：对已创建的实例改值会触发重建。
 - **SSH key generation**: `scripts/generate_key.sh` is called as a Terraform `data.external` source. If `ecs_ssh_public_key` is provided, it uses that key; otherwise it generates a new RSA 4096-bit key pair in `keys/KEY-<instance_name>` (idempotent — skips if the file already exists).
 - **Ubuntu image**: `data.alicloud_images.ubuntu` queries for the latest Ubuntu 24.04 image matching `^ubuntu_24_04_x64_20G_alibase_`.
-- **Exactly one public IP**: The `ecs_instances` variable has a `validation` block enforcing that exactly one instance has `public_ip = true`.
+- **Bastion constraints**: `public_devices` 变量通过 `validation` 块强制「有且仅有一个 `is_bastion = true`」「堡垒机必须 `public_ip = true`」「公网子网所有设备必须 `public_ip = true`」；子网 CIDR 的包含/不重叠关系由 `check "subnet_ranges"` 块校验（跨变量，validation 无法表达）。

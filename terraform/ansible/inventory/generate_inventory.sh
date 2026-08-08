@@ -3,9 +3,15 @@
 # Ansible Dynamic Inventory Generator
 # 从 Terraform 输出中解析 ECS 实例信息，生成 Ansible inventory JSON
 #
+# 分组:
+#   nat_gateway  堡垒机（is_bastion = true，唯一有独立公网 IP 直连的主机）
+#   public       公网设备（非堡垒机，公网子网；有独立公网 IP 的直连，否则走跳板）
+#   internal     内网设备（内网子网，通过堡垒机 ProxyJump 访问）
+#
 # 使用方法:
 #   ./generate_inventory.sh --list          # 输出完整 inventory
 #   ./generate_inventory.sh --host <name>   # 输出单台主机变量（可选）
+#   ./generate_inventory.sh --write [路径]  # 固化为静态 inventory（hosts.yml）
 # ============================================================
 
 set -euo pipefail
@@ -46,6 +52,16 @@ key_file_for() {
     echo "$KEY_DIR/KEY-${instance_name}"
 }
 
+# bash 数组 → JSON 字符串数组
+to_json_array() {
+    local -n arr="$1"
+    if ((${#arr[@]} == 0)); then
+        echo "[]"
+        return 0
+    fi
+    printf '%s\n' "${arr[@]}" | jq -R -s -c 'split("\n") | map(select(. != ""))'
+}
+
 # 生成完整 inventory JSON
 generate_inventory() {
     local tf_output
@@ -53,7 +69,7 @@ generate_inventory() {
 
     # 检查是否为空状态标记
     if echo "$tf_output" | jq -e '._empty // false' >/dev/null 2>&1; then
-        echo '{"nat_gateway":{"hosts":[],"vars":{}},"internal":{"hosts":[],"vars":{}},"_meta":{"hostvars":{}}}'
+        echo '{"nat_gateway":{"hosts":[],"vars":{}},"public":{"hosts":[],"vars":{}},"internal":{"hosts":[],"vars":{}},"_meta":{"hostvars":{}}}'
         return 0
     fi
 
@@ -65,23 +81,31 @@ generate_inventory() {
     vpc_cidr=$(echo "$tf_output" | jq -r '.vpc_cidr.value // "172.16.0.0/16"')
 
     if [[ -z "$bastion_name" || -z "$bastion_public_ip" || "$bastion_public_ip" == "null" ]]; then
-        echo '{"nat_gateway":{"hosts":[],"vars":{}},"internal":{"hosts":[],"vars":{}},"_meta":{"hostvars":{}}}'
-        echo "WARN: No bastion (public-IP ECS) found in terraform outputs." >&2
+        echo '{"nat_gateway":{"hosts":[],"vars":{}},"public":{"hosts":[],"vars":{}},"internal":{"hosts":[],"vars":{}},"_meta":{"hostvars":{}}}'
+        echo "WARN: No bastion (is_bastion ECS) found in terraform outputs." >&2
         exit 0
     fi
 
-    # 解析所有 ECS 实例
-    local all_instances internal_names nat_gateway_hosts internal_hosts
+    # 解析所有 ECS 实例 + 公网 IP 设备（有独立公网 IP 的非堡垒机）
+    local all_instances public_ip_map
     all_instances=$(echo "$tf_output" | jq -r '.ecs_private_ips.value | keys[]')
-    internal_names=$(echo "$all_instances" | grep -v "^${bastion_name}$" || true)
+    public_ip_map=$(echo "$tf_output" | jq -c '.ecs_public_ips.value // {}')
 
-    nat_gateway_hosts=("$bastion_name")
-    readarray -t internal_hosts < <(echo "$internal_names" || true)
+    # 分组: nat_gateway（堡垒机）/ public（公网设备）/ internal（内网设备）
+    local public_hosts=() internal_hosts=()
+    while IFS= read -r instance_name; do
+        [[ -z "$instance_name" || "$instance_name" == "$bastion_name" ]] && continue
+        if echo "$public_ip_map" | jq -e --arg n "$instance_name" 'has($n)' >/dev/null 2>&1; then
+            public_hosts+=("$instance_name")
+        else
+            internal_hosts+=("$instance_name")
+        fi
+    done <<< "$all_instances"
 
     # ---- 构建 hostvars ----
     local hostvars_json=""
 
-    # 堡垒机（NAT 网关）hostvars
+    # 堡垒机（NAT 网关）hostvars — 直连公网 IP
     local bastion_key
     bastion_key=$(key_file_for "$bastion_name")
     hostvars_json+="\"$bastion_name\":{"
@@ -93,49 +117,52 @@ generate_inventory() {
     hostvars_json+="\"bastion_private_ip\":\"$bastion_private_ip\""
     hostvars_json+="}"
 
-    # 内部 ECS hostvars（通过堡垒机 ProxyJump 访问）
-    for instance_name in $internal_names; do
-        local priv_ip
+    # 其余 ECS hostvars: 有独立公网 IP 直连；否则通过堡垒机 ProxyJump 访问
+    while IFS= read -r instance_name; do
+        [[ -z "$instance_name" || "$instance_name" == "$bastion_name" ]] && continue
+        local priv_ip pub_ip
         priv_ip=$(echo "$tf_output" | jq -r ".ecs_private_ips.value[\"$instance_name\"] // \"\"")
         if [[ -z "$priv_ip" || "$priv_ip" == "null" ]]; then
             continue
+        fi
+        pub_ip=$(echo "$public_ip_map" | jq -r --arg n "$instance_name" '.[$n] // ""')
+        if [[ -z "$pub_ip" || "$pub_ip" == "null" ]]; then
+            pub_ip=""
         fi
         local instance_key
         instance_key=$(key_file_for "$instance_name")
 
         hostvars_json+=",\"$instance_name\":{"
-        hostvars_json+="\"ansible_host\":\"$priv_ip\","
+        hostvars_json+="\"ansible_host\":\"${pub_ip:-$priv_ip}\","
         hostvars_json+="\"ansible_user\":\"root\","
         hostvars_json+="\"ansible_ssh_private_key_file\":\"$instance_key\","
-        # 通过堡垒机跳板访问内部 ECS
-        # ProxyCommand 值必须加单引号，否则 Ansible 会按空格分割参数导致 SSH 报错
-        hostvars_json+="\"ansible_ssh_common_args\":\"-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ProxyCommand='ssh -i $bastion_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -W $priv_ip:22 root@$bastion_public_ip'\","
+        if [[ -n "$pub_ip" ]]; then
+            # 有独立公网 IP → 直连
+            hostvars_json+="\"ansible_ssh_common_args\":\"-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null\","
+        else
+            # 无公网 IP → 通过堡垒机跳板访问
+            # ProxyCommand 值必须加单引号，否则 Ansible 会按空格分割参数导致 SSH 报错
+            hostvars_json+="\"ansible_ssh_common_args\":\"-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ProxyCommand='ssh -i $bastion_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -W $priv_ip:22 root@$bastion_public_ip'\","
+        fi
         hostvars_json+="\"gateway_ip\":\"$bastion_private_ip\","
         hostvars_json+="\"vpc_cidr\":\"$vpc_cidr\""
         hostvars_json+="}"
-    done
+    done <<< "$all_instances"
 
     # ---- 组装最终 JSON ----
-    local nat_hosts_json="["
-    nat_hosts_json+="\"$bastion_name\""
-    nat_hosts_json+="]"
-
-    local internal_hosts_json="["
-    local first=true
-    for name in $internal_names; do
-        if $first; then
-            internal_hosts_json+="\"$name\""
-            first=false
-        else
-            internal_hosts_json+=",\"$name\""
-        fi
-    done
-    internal_hosts_json+="]"
+    local nat_hosts_json public_hosts_json internal_hosts_json
+    nat_hosts_json="[\"$bastion_name\"]"
+    public_hosts_json=$(to_json_array public_hosts)
+    internal_hosts_json=$(to_json_array internal_hosts)
 
     cat <<EOF
 {
   "nat_gateway": {
     "hosts": $nat_hosts_json,
+    "vars": {}
+  },
+  "public": {
+    "hosts": $public_hosts_json,
     "vars": {}
   },
   "internal": {
@@ -177,7 +204,7 @@ write_static_inventory() {
         echo "all:"
         echo "  children:"
         echo "$inventory_json" | jq -r '
-            ["nat_gateway", "internal"][] as $g |
+            ["nat_gateway", "public", "internal"][] as $g |
             "    \($g):",
             "      hosts:",
             (.[$g].hosts[] as $h |
@@ -188,10 +215,11 @@ write_static_inventory() {
         '
     } > "$out_path"
 
-    hosts_count=$(echo "$inventory_json" | jq -r '[.nat_gateway.hosts[], .internal.hosts[]] | length')
+    hosts_count=$(echo "$inventory_json" | jq -r '[.nat_gateway.hosts[], .public.hosts[], .internal.hosts[]] | length')
     echo "✅ 静态 inventory 已生成: $out_path"
     echo "   主机数: $hosts_count"
     echo "   堡垒机: $(echo "$inventory_json" | jq -r '.nat_gateway.hosts | join(", ")')"
+    echo "   公网机: $(echo "$inventory_json" | jq -r '.public.hosts | join(", ")')"
     echo "   内部机: $(echo "$inventory_json" | jq -r '.internal.hosts | join(", ")')"
     echo ""
     echo "后续命令无需再指定 -i："

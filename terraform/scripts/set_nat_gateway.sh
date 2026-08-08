@@ -102,6 +102,8 @@ NETPLAN_FILE="/etc/netplan/99-nat-gateway-route.yaml"
 cat > "$NETPLAN_FILE" << NETPLAN_EOF
 # NAT 网关路由配置（由 set_nat_gateway.sh 生成）
 # 将默认路由指向 NAT 网关 ECS ($GATEWAY_IP)
+# metric: 50 — 低于云初始化 DHCP 默认路由的 metric(100)，
+# 保证重启后默认路由确定为 NAT 网关，而非在两条默认路由间不确定。
 network:
   version: 2
   ethernets:
@@ -109,6 +111,7 @@ network:
       routes:
         - to: default
           via: ${GATEWAY_IP}
+          metric: 50
 NETPLAN_EOF
 
 # 设置安全权限

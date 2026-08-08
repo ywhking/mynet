@@ -1,5 +1,5 @@
 # ============================================================
-# Ansible Playbook: 配置 NAT 网关 + 内部 ECS 路由
+# Ansible Playbook: 配置堡垒机 NAT 网关 + 验证内部 ECS 外网连通
 # ============================================================
 #
 # 使用方法:
@@ -15,7 +15,7 @@
 #   # 仅 NAT 网关
 #   ansible-playbook -i inventory/generate_inventory.sh playbooks/setup-all.yml --tags nat
 #
-#   # 仅内部 ECS 网关配置
+#   # 仅验证内部 ECS 外网连通
 #   ansible-playbook -i inventory/generate_inventory.sh playbooks/setup-all.yml --tags client
 #
 # 前置条件:
@@ -175,12 +175,12 @@
         msg: "{{ nat_answers.stdout_lines }}"
 
     # --- 执行 NAT 网关脚本（受 --check 影响，dry-run 时跳过） ---
-    # 策略：前 7 个特定答案（接口名、IP、模式等）通过 printf 提供，
-    # 后续所有 y/n 提示（确认、清空规则等）由 yes 命令处理。
-    # 这种方式对脚本中的条件分支具有天然的鲁棒性。
+    # 策略：使用上方检测任务构建的 nat_answers 答案序列（网卡名、网段等
+    # 均来自真实环境），后续所有 y/n 提示（确认、清空规则等）由 yes 命令处理。
+    # 不再硬编码 eth0 / 172.16.0.0/16，vpc_cidr 参数化后 MASQUERADE 源网段自动匹配。
     - name: 执行 NAT 网关配置脚本（非交互式）
       ansible.builtin.shell: |
-        { printf '%s\n' "eth0" "y" "y" "eth0" "172.16.0.0/16" "2" "n"; yes; } | bash /root/install_nat_gateway.sh
+        { printf '%s\n' {% for item in nat_answers.stdout_lines %}{{ item | quote }} {% endfor %}; yes; } | bash /root/install_nat_gateway.sh
       register: nat_result
       changed_when: true
       async: 300
@@ -217,8 +217,9 @@
       ansible.builtin.assert:
         that:
           - "'MASQUERADE' in verify_nat.stdout or 'SNAT' in verify_nat.stdout"
-        success_msg: "✓ NAT 规则已正确配置"
-        fail_msg: "✗ NAT 规则未生效 — 请先执行 ansible-playbook（不带 --check）"
+          - "vpc_cidr in verify_nat.stdout"
+        success_msg: "✓ NAT 规则已正确配置（{{ vpc_cidr }} 命中 MASQUERADE/SNAT）"
+        fail_msg: "✗ NAT 规则未生效或源网段不匹配 {{ vpc_cidr }} — 请检查堡垒机网卡与网段参数"
       when: not ansible_check_mode
 
     - name: NAT 规则检查（check 模式）
@@ -229,9 +230,14 @@
       when: ansible_check_mode
 
 # ============================================================
-# Play 2: 配置内部 ECS 的默认网关指向 NAT 网关
+# Play 2: 验证内部 ECS 外网连通（经 VPC 路由表 → 堡垒机 NAT）
+# 内网 vswitch 的 VPC 路由表已含 0.0.0.0/0 → 堡垒机 ENI，
+# 内部 ECS 保持云初始化默认路由（via vrouter）即可，无需逐机改路由。
+# 历史教训：曾逐机把默认路由改为 172.16.0.62（与 ECS 不在同一 /24 网段，
+# 且无覆盖路由），导致「删旧路由 → 加新路由失败 → ECS 失联、SSH 会话
+# 死亡 → Ansible 任务无限挂起」。本 Play 只做验证，不做任何变更。
 # ============================================================
-- name: Configure internal ECS to use NAT gateway
+- name: Verify internal ECS connectivity via VPC route table NAT
   hosts: internal
   gather_facts: yes
   tags: [client]
@@ -241,43 +247,21 @@
       ansible.builtin.debug:
         msg:
           - "本机: {{ inventory_hostname }} ({{ ansible_host }})"
-          - "NAT 网关地址: {{ gateway_ip }}"
+          - "NAT 网关（堡垒机）: {{ gateway_ip }}"
           - "VPC CIDR: {{ vpc_cidr }}"
 
-    - name: 上传 set_nat_gateway.sh
-      ansible.builtin.copy:
-        src: "{{ playbook_dir }}/../../scripts/set_nat_gateway.sh"
-        dest: /root/set_nat_gateway.sh
-        owner: root
-        group: root
-        mode: "0755"
-
-    # --- 执行网关配置（受 --check 影响） ---
-    - name: 将默认路由指向 NAT 网关
-      ansible.builtin.shell: |
-        bash /root/set_nat_gateway.sh "{{ gateway_ip }}" "{{ vpc_cidr }}"
-      register: gateway_result
-      changed_when: true
-      when: not ansible_check_mode
-
-    - name: 网关配置输出
-      ansible.builtin.debug:
-        msg: "{{ gateway_result.stdout_lines | default(['(skipped in check mode)']) }}"
-
-    # --- 验证（始终执行） ---
-    - name: 验证当前路由配置
+    # --- 验证（始终执行，只读） ---
+    - name: 验证默认路由与外网连通性
       ansible.builtin.shell:
         executable: /bin/bash
         cmd: |
           set -eu
+          DEFAULT_VIA=$(ip route show default | awk '/^default/ {print $3; exit}')
+          echo "default_via=${DEFAULT_VIA:-NONE}"
           echo "=== 默认路由 ==="
           ip route show default 2>/dev/null || echo "(no default route)"
-          echo ""
-          echo "=== 完整路由表 ==="
-          ip route show
-          echo ""
           echo "=== 外网连通性测试 ==="
-          ping -c 2 -W 3 8.8.8.8 2>/dev/null && echo "✓ 外网可达" || echo "✗ 外网 ping 失败"
+          if ping -c 2 -W 3 8.8.8.8 >/dev/null 2>&1; then echo "PING_OK"; else echo "PING_FAIL"; fi
       register: verify_client
       changed_when: false
       check_mode: false
@@ -286,12 +270,20 @@
       ansible.builtin.debug:
         msg: "{{ verify_client.stdout_lines }}"
 
-    - name: 确认默认路由已指向 NAT 网关
+    - name: 确认默认路由存在
       ansible.builtin.assert:
         that:
-          - "'{{ gateway_ip }}' in verify_client.stdout"
-        success_msg: "✓ {{ inventory_hostname }} 网关已指向 NAT 网关 ({{ gateway_ip }})"
-        fail_msg: "✗ {{ inventory_hostname }} 网关配置失败 — 请先执行 ansible-playbook（不带 --check）"
+          - "'default_via=NONE' not in verify_client.stdout"
+        success_msg: "✓ {{ inventory_hostname }} 默认路由存在（via vrouter，外网流量由 VPC 路由表转发至堡垒机 NAT）"
+        fail_msg: "✗ {{ inventory_hostname }} 缺少默认路由 — 请检查云初始化/DHCP 配置"
+      when: not ansible_check_mode
+
+    - name: 确认外网连通性（经 VPC 路由表 → 堡垒机 NAT）
+      ansible.builtin.assert:
+        that:
+          - "'PING_OK' in verify_client.stdout"
+        success_msg: "✓ {{ inventory_hostname }} 外网可达（经 VPC 路由表 → 堡垒机 NAT）"
+        fail_msg: "✗ {{ inventory_hostname }} 外网不通 — 请检查堡垒机 NAT 规则（Play 1 输出）与 VPC 路由表（0.0.0.0/0 → 堡垒机 ENI）"
       when: not ansible_check_mode
 
     - name: 路由检查（check 模式）
@@ -318,14 +310,14 @@
           - "=========================================="
           - ""
           - "NAT 网关 ECS: {{ groups['nat_gateway'] | default([]) | join(', ') }}"
+          - "公网设备:     {{ groups['public'] | default([]) | join(', ') }}"
           - "内部 ECS:     {{ groups['internal'] | default([]) | join(', ') }}"
           - ""
           - "验证步骤:"
           - "  1. 登录内部 ECS: ssh -J root@<堡垒机公网IP> root@<内部ECS内网IP>"
-          - "  2. 测试外网: ping 8.8.8.8"
-          - "  3. 查看路由: ip route show default"
+          - "  2. 测试外网: ping 8.8.8.8（经 VPC 路由表 → 堡垒机 NAT）"
           - ""
           - "回滚操作:"
           - "  NAT 网关: ssh root@<堡垒机公网IP> 'bash /root/rollback_nat.sh'"
-          - "  内部 ECS: ssh root@<内部ECS> 'rm /etc/netplan/99-nat-gateway-route.yaml && netplan apply'"
+          - "  内部 ECS: 无需配置（VPC 路由表 0.0.0.0/0 → 堡垒机 ENI 负责转发）"
           - "=========================================="

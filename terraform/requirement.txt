@@ -1,0 +1,14 @@
+terraform脚本需求
+1、所有新建资源都属于同一地域，该地域通过参数指定
+2、新建1个资源组，所有新建资源都属于该资源组，资源组名称通过参数指定
+3、新建1个VPC，VPC的所属IP段通过参数指定
+4、在新建VPC中，新建两个子网，一个是public，一个是internal，public 和 internal之间互通
+5、public 子网中的IP段通过参数指定，子网中的所有ECS都分配公网IP，可以指定一台ECS作为堡垒机，是否是堡垒机通过参数指定
+6、internal子网中的IP段通过参数指定, 子网中所有ECS 都没有公网IP，子网中的ECS可以通过堡垒机访问互联网
+
+
+ansible脚本需求
+1、将public子网中，带有堡垒机属性的ECS设置成堡垒机，internal子网中的ECS可以通过该堡垒机访问外网
+2、修改internal子网中各ECS的网关配置，可以通过public子网中的堡垒机访问外网
+3、可以在public子网中指定的ECS上部署相关软件
+4、可以通过堡垒机在internal子网中指定的ECS上部署相关软件

@@ -12,25 +12,45 @@ vpc_cidr = "172.16.0.0/16"
 # 3. 资源组名称 (Resource group name) — 必填
 resource_group_name = "tf-resource-group"
 
-# 4. ECS 实例列表 — 必填
-#    map key = ECS 实例名称
-#    public_ip 必须且只能有一个为 true（有公网 IP 的实例）
-#    密钥对名称自动生成为 "KEY-<实例名称>"
-ecs_instances = {
-  "tf-ecs-public" = {
-    host_name = "public"
-    public_ip = true
+# 4. 公网设备（公网子网）— 必填
+#    cidr      公网子网 IP 地址段（须位于 vpc_cidr 内，且与内网子网不重叠）
+#    instances map key = ECS 实例名称；密钥对名称自动生成为 "KEY-<实例名称>"
+#      host_name  实例主机名
+#      public_ip  是否有公网 IP（需求要求公网子网设备均分配公网 IP，必须为 true；
+#                 分配后直连互联网，带宽 10Mbps 按流量计费）
+#      is_bastion 是否堡垒机（NAT 网关）— 有且仅有一个，且必须 public_ip = true
+public_devices = {
+  cidr = "172.16.0.0/24"
+  instances = {
+    "tf-ecs-bastion" = {
+      host_name  = "bastion"
+      public_ip  = true
+      is_bastion = true
+    }
+    "tf-ecs-web" = {
+      host_name  = "web"
+      public_ip  = true
+      is_bastion = false
+    }
   }
-  "tf-ecs-private" = {
-    host_name = "private"
-    public_ip = false
+}
+
+# 5. 内网设备（内网子网）— 必填
+#    cidr      内网子网 IP 地址段（须位于 vpc_cidr 内，且与公网子网不重叠）
+#    instances 实例无公网 IP，外网流量经堡垒机 NAT 转发
+internal_devices = {
+  cidr = "172.16.1.0/24"
+  instances = {
+    "tf-ecs-db" = {
+      host_name = "db"
+    }
   }
 }
 
 # --- 以下为可选参数 ---
 
-# 5. SSH 公钥内容（可选，留空则通过 generate_key.sh 本地自动生成）
+# 6. SSH 公钥内容（可选，留空则通过 generate_key.sh 本地自动生成）
 # ecs_ssh_public_key = "ssh-rsa AAAAB3NzaC1yc2E..."
 
-# 6. ECS 实例类型（可选，默认 ecs.t6-c1m2.large）
+# 7. ECS 实例类型（可选，默认 ecs.t6-c1m2.large）
 # ecs_instance_type = "ecs.t6-c1m2.large"
