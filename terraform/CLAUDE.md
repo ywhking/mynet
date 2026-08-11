@@ -20,6 +20,7 @@ The `scripts/` directory contains shell scripts used by Terraform and Ansible:
 | `scripts/generate_key.sh` | Terraform `data.external.ssh_key` | Generates SSH key pair locally in `keys/` if not already present; returns public key to Terraform |
 | `scripts/install_nat_gateway.sh` | Ansible playbook (uploaded to bastion) | Interactive script that configures iptables NAT (MASQUERADE/SNAT + optional DNAT), IP forwarding, and persistence on the bastion ECS |
 | `scripts/set_nat_gateway.sh` | Ansible playbook (uploaded to internal ECS) | Sets the default route on an internal ECS to point at the NAT gateway; persists via Netplan (Ubuntu 24.04) |
+| `scripts/install_docker.sh` | Ansible playbook `setup-docker.yml` (uploaded to target ECS) | Installs Docker Engine on Ubuntu 24.04 from official/aliyun apt repo; optional registry mirror via `DOCKER_MIRRORS` env; idempotent |
 
 ## Required Input Parameters
 
@@ -27,7 +28,7 @@ The `scripts/` directory contains shell scripts used by Terraform and Ansible:
 |------|------|--------|
 | `alicloud_region` | 地域 | `cn-wulanchabu` |
 | `resource_group_name` | 资源组名称 | `tf-resource-group` |
-| `public_devices` | 公网设备配置（公网子网 IP 地址段 + ECS 实例列表，含 `host_name` / `public_ip` / `is_bastion`） | 见下方示例 |
+| `public_devices` | 公网设备配置（公网子网 IP 地址段 + ECS 实例列表，含 `host_name` / `public_ip` / `is_bastion` / `domain_name`） | 见下方示例 |
 | `internal_devices` | 内网设备配置（内网子网 IP 地址段 + ECS 实例列表，含 `host_name`） | 见下方示例 |
 
 ## Optional Input Parameters
@@ -39,23 +40,27 @@ The `scripts/` directory contains shell scripts used by Terraform and Ansible:
 | `sg_name` | 安全组名称 | `tf-sg-default` |
 | `ecs_instance_type` | ECS 实例类型 | `ecs.t6-c1m2.large` |
 | `ecs_ssh_public_key` | SSH 公钥内容（留空则本地自动生成） | `""` |
+| `domain_name` | 已注册的主域名（需已接入阿里云云解析 DNS），为 public 子网所有 ECS 添加 A 记录 `<实例 domain_name>.<domain_name>` → 实例公网 IP | `ohmynet.vip` |
 
 ### `public_devices` / `internal_devices` 格式示例
 
 ```hcl
-# 公网设备（公网子网）— 有且仅有一个 is_bastion = true，且该实例必须 public_ip = true
+# 公网设备（公网子网）— 有且仅有一个 is_bastion = true，且该实例必须 public_ip = true；
+# 每个实例必须设置 domain_name（子域名前缀，不含主域名）→ 生成 A 记录 <domain_name>.<主域名>
 public_devices = {
   cidr = "172.16.0.0/24"
   instances = {
     "web-server" = {
-      host_name  = "web"
-      public_ip  = true    # 是否有公网 IP
-      is_bastion = false   # 是否堡垒机（NAT 网关）
+      host_name   = "web"
+      public_ip   = true    # 是否有公网 IP
+      is_bastion  = false   # 是否堡垒机（NAT 网关）
+      domain_name = "web"   # 子域名前缀 → web.ohmynet.vip
     }
     "bastion" = {
-      host_name  = "bastion"
-      public_ip  = true
-      is_bastion = true
+      host_name   = "bastion"
+      public_ip   = true
+      is_bastion  = true
+      domain_name = "bastion"   # → bastion.ohmynet.vip
     }
   }
 }
@@ -103,6 +108,7 @@ After setting them, run `terraform plan` / `terraform apply` as normal.
 | `bastion_name` | Name of the bastion (NAT gateway) ECS (`is_bastion = true`) |
 | `bastion_public_ip` | Public IP of the bastion ECS |
 | `bastion_private_ip` | Private IP of the bastion ECS |
+| `dns_records` | DNS A records created (instance name → full domain name, e.g. `bastion.ohmynet.vip`) |
 | `vpc_cidr` | VPC CIDR block |
 | `vswitch_public_cidr` | Public subnet VSwitch CIDR block (`public_devices.cidr`) |
 | `vswitch_internal_cidr` | Internal subnet VSwitch CIDR block (`internal_devices.cidr`) |
@@ -142,7 +148,8 @@ ansible/
 │   ├── generate_inventory.sh            # inventory 脚本（nat_gateway/public/internal 三组；--list 动态输出 / --write 生成静态 hosts.yml）
 │   └── hosts.yml                        # 静态 inventory（自动生成，请勿手动编辑）
 ├── playbooks/
-│   └── setup-all.yml                    # 主 playbook：NAT 网关 + 内部 ECS 网关配置
+│   ├── setup-all.yml                    # 主 playbook：NAT 网关 + 内部 ECS 网关配置
+│   └── setup-docker.yml                 # 在指定 ECS 上安装 Docker（上传并执行 scripts/install_docker.sh）
 └── group_vars/
     └── all.yml                          # （可选）全局变量覆盖
 ```
@@ -182,6 +189,18 @@ ansible-playbook playbooks/setup-all.yml --tags nat
 
 # 仅配置内部 ECS 网关
 ansible-playbook playbooks/setup-all.yml --tags client
+
+# 在所有 ECS 上安装 Docker
+ansible-playbook playbooks/setup-docker.yml
+
+# 仅在指定分组 / 单台主机上安装 Docker
+ansible-playbook playbooks/setup-docker.yml -l internal
+ansible-playbook playbooks/setup-docker.yml -l web-server
+
+# 中国区加速安装（阿里云 apt 镜像源 + 镜像加速器）
+ansible-playbook playbooks/setup-docker.yml -l internal \
+  -e docker_repo_base=https://mirrors.aliyun.com/docker-ce/linux/ubuntu \
+  -e docker_mirrors=https://docker.m.daocloud.io
 ```
 
 > **注意**：`terraform apply` / `terraform destroy` 之后，必须重新执行
@@ -238,7 +257,7 @@ ssh -J root@<bastion-public-ip> root@<internal-ecs-ip> \
 ## Architecture
 
 - **Provider**: Alicloud (`hashicorp/alicloud`, pinned to `1.285.0` in `.terraform.lock.hcl`)
-- **Multi-file configuration**: Provider in `main.tf`, VPC in `vpc.tf`, ECS in `ecs.tf`, Resource Group in `rg.tf`.
+- **Multi-file configuration**: Provider in `main.tf`, VPC in `vpc.tf`, ECS in `ecs.tf`, Resource Group in `rg.tf`, DNS in `dns.tf`.
 - **Required variables** (`alicloud_region`, `resource_group_name`, `public_devices`, `internal_devices`) have no defaults — must be set via `.tfvars` or `-var`.
 - **Other variables** have defaults — override via `.tfvars` or `-var` CLI flags.
 - **No external CLI dependencies**: 关闭堡垒机源/目的检查由 provider 原生 `source_dest_check` 参数完成（内部调用 `ModifyNetworkInterfaceAttribute`），无需安装 aliyun CLI。

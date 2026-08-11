@@ -27,13 +27,14 @@ variable "sg_name" {
 # 公网设备：公网子网 IP 地址段 + ECS 实例列表（名称 / 是否有公网 IP / 是否堡垒机）
 # 内网设备：内网子网 IP 地址段 + ECS 实例列表（名称）
 variable "public_devices" {
-  description = "公网设备配置：公网子网 IP 地址段 + ECS 实例列表（host_name / public_ip / is_bastion）"
+  description = "公网设备配置：公网子网 IP 地址段 + ECS 实例列表（host_name / public_ip / is_bastion / domain_name）"
   type = object({
     cidr = string
     instances = map(object({
-      host_name  = optional(string)
-      public_ip  = optional(bool, true) # 需求要求公网子网设备均分配公网 IP（见下方 validation）
-      is_bastion = optional(bool, false)
+      host_name   = optional(string)
+      public_ip   = optional(bool, true) # 需求要求公网子网设备均分配公网 IP（见下方 validation）
+      is_bastion  = optional(bool, false)
+      domain_name = optional(string) # 子域名前缀（不含主域名），用于添加云解析 A 记录
     }))
   })
 
@@ -61,6 +62,13 @@ variable "public_devices" {
       alltrue([for k, v in var.public_devices.instances : v.public_ip])
     )
     error_message = "需求要求 public 子网中所有 ECS 都分配公网 IP：public_devices.instances 的每个实例都必须设置 public_ip = true。"
+  }
+
+  validation {
+    condition = (
+      alltrue([for k, v in var.public_devices.instances : length(try(v.domain_name, "")) > 0])
+    )
+    error_message = "public_devices.instances 的每个实例都必须设置 domain_name（子域名前缀，不含主域名），用于添加云解析 A 记录，如 domain_name = \"bastion\" → bastion.ohmynet.vip。"
   }
 }
 

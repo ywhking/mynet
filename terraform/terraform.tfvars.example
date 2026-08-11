@@ -15,10 +15,12 @@ resource_group_name = "tf-resource-group"
 # 4. 公网设备（公网子网）— 必填
 #    cidr      公网子网 IP 地址段（须位于 vpc_cidr 内，且与内网子网不重叠）
 #    instances map key = ECS 实例名称；密钥对名称自动生成为 "KEY-<实例名称>"
-#      host_name  实例主机名
-#      public_ip  是否有公网 IP（需求要求公网子网设备均分配公网 IP，必须为 true；
-#                 分配后直连互联网，带宽 10Mbps 按流量计费）
-#      is_bastion 是否堡垒机（NAT 网关）— 有且仅有一个，且必须 public_ip = true
+#      host_name   实例主机名
+#      public_ip   是否有公网 IP（需求要求公网子网设备均分配公网 IP，必须为 true；
+#                  分配后直连互联网，带宽 10Mbps 按流量计费）
+#      is_bastion  是否堡垒机（NAT 网关）— 有且仅有一个，且必须 public_ip = true
+#      domain_name 子域名前缀（不含主域名）— 必填，用于添加云解析 A 记录：
+#                  记录完整域名为 <domain_name>.<主域名>（如 bastion.ohmynet.vip）→ 该实例公网 IP
 public_devices = {
   cidr = "172.16.0.0/24"
   instances = {
@@ -26,11 +28,13 @@ public_devices = {
       host_name  = "bastion"
       public_ip  = true
       is_bastion = true
+      domain_name = "bastion"
     }
     "tf-ecs-web" = {
       host_name  = "web"
       public_ip  = true
       is_bastion = false
+      domain_name = "web"
     }
   }
 }
@@ -54,3 +58,7 @@ internal_devices = {
 
 # 7. ECS 实例类型（可选，默认 ecs.t6-c1m2.large）
 # ecs_instance_type = "ecs.t6-c1m2.large"
+
+# 8. 已注册的主域名（可选，默认 ohmynet.vip）— 需已接入阿里云云解析 DNS。
+#    仅为堡垒机（is_bastion = true）添加 A 记录：<host_name>.<domain_name> → 堡垒机公网 IP
+# domain_name = "ohmynet.vip"

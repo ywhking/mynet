@@ -1,0 +1,106 @@
+# ============================================================
+# Ansible Playbook: 在指定 ECS 上安装 Docker（Ubuntu 24.04）
+# ============================================================
+#
+# 使用方法:
+#   # 所有主机（nat_gateway + public + internal）
+#   ansible-playbook playbooks/setup-docker.yml
+#
+#   # 仅指定分组（内网设备 / 公网设备 / 堡垒机）
+#   ansible-playbook playbooks/setup-docker.yml -l internal
+#   ansible-playbook playbooks/setup-docker.yml -l public
+#
+#   # 指定单台主机（实例名，即 terraform.tfvars 中的 key）
+#   ansible-playbook playbooks/setup-docker.yml -l web-server
+#
+#   # 中国区加速: 使用阿里云 docker-ce apt 镜像源 + 镜像加速器
+#   ansible-playbook playbooks/setup-docker.yml -l internal \
+#     -e docker_repo_base=https://mirrors.aliyun.com/docker-ce/linux/ubuntu \
+#     -e docker_mirrors=https://docker.m.daocloud.io
+#
+#   # 跳过 hello-world 验证
+#   ansible-playbook playbooks/setup-docker.yml -e RUN_HELLO_WORLD=0
+#
+# 前置条件:
+#   - terraform apply 已执行完毕，且已运行 ./inventory/generate_inventory.sh --write
+#   - 目标 ECS 为 Ubuntu 24.04
+# ============================================================
+
+- name: Install Docker on target ECS
+  hosts: "{{ docker_target | default('all') }}"
+  gather_facts: yes
+  tags: [docker]
+
+  # 注意: 不要在 vars 里定义 docker_repo_base / docker_mirrors 的自引用默认值
+  #   （如 "{{ docker_repo_base | default(...) }}"），Ansible 会递归模板求值报错。
+  #   改为在任务内用 default(..., true) 解析——-e 传入时正常覆盖，未传入时用默认值。
+
+  tasks:
+    - name: 显示目标主机信息
+      ansible.builtin.debug:
+        msg:
+          - "主机: {{ inventory_hostname }} ({{ ansible_host }})"
+          - "系统: {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}"
+          - "apt 源: {{ docker_repo_base | default('https://download.docker.com/linux/ubuntu', true) }}"
+          - "镜像加速器: {{ docker_mirrors | default('（未配置）', true) }}"
+
+    # --- 上传脚本 ---
+    - name: 上传 install_docker.sh 到目标 ECS
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../../scripts/install_docker.sh"
+        dest: /root/install_docker.sh
+        owner: root
+        group: root
+        mode: "0755"
+
+    # --- 执行安装（受 --check 影响，dry-run 时跳过） ---
+    # 脚本本身幂等：docker 已安装则跳过安装，只做服务/组配置。
+    # 通过 environment 传递 apt 源与镜像加速器，脚本读取同名环境变量。
+    - name: 执行 Docker 安装脚本
+      ansible.builtin.shell: bash /root/install_docker.sh
+      environment:
+        APT_REPO_BASE: "{{ docker_repo_base | default('https://download.docker.com/linux/ubuntu', true) }}"
+        DOCKER_MIRRORS: "{{ docker_mirrors | default('', true) }}"
+      register: docker_install
+      changed_when: "'跳过安装' not in docker_install.stdout"
+      async: 600
+      poll: 10
+      when: not ansible_check_mode
+
+    - name: 安装输出
+      ansible.builtin.debug:
+        msg: "{{ docker_install.stdout_lines | default(['(skipped in check mode)']) }}"
+
+    # --- 验证（始终执行，只读） ---
+    - name: 验证 docker 与 compose 版本
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -eu
+          docker --version
+          docker compose version
+          systemctl is-active docker
+      register: docker_verify
+      changed_when: false
+      check_mode: false
+
+    - name: 验证结果
+      ansible.builtin.debug:
+        msg: "{{ docker_verify.stdout_lines }}"
+
+    - name: 确认 docker 已安装并运行
+      ansible.builtin.assert:
+        that:
+          - "'Docker version' in docker_verify.stdout"
+          - "'Docker Compose version' in docker_verify.stdout"
+          - "'active' in docker_verify.stdout"
+        success_msg: "✓ {{ inventory_hostname }} Docker 已安装并运行"
+        fail_msg: "✗ {{ inventory_hostname }} Docker 未正确安装或服务未运行"
+      when: not ansible_check_mode
+
+    - name: 验证（check 模式）
+      ansible.builtin.debug:
+        msg:
+          - "⚠️  当前处于 check 模式，安装与验证已跳过"
+          - "   实际执行: ansible-playbook playbooks/setup-docker.yml"
+      when: ansible_check_mode
