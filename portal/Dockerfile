@@ -47,26 +47,46 @@ RUN apt-get update \
       openssh-client \
  && rm -rf /var/lib/apt/lists/*
 
-# ansible in its OWN venv, so its jinja2/PyYAML/packaging/resolvelib pins can
-# never fight the app's pinned set. Only ansible-core is required — every
-# module in the four playbooks is `ansible.builtin.*`, so there are no Galaxy
-# collections to install. Floor is 2.13 (ansible.cfg uses `callback_result_format`).
+# The app's dependencies FIRST, while `pip` still resolves to the base
+# interpreter. Doing this after the ansible venv exists would install the app
+# into that venv (whichever `pip` is first on PATH wins).
 ARG PIP_INDEX_URL=
-RUN python -m venv /opt/ansible \
- && /opt/ansible/bin/pip install --no-cache-dir \
-      ${PIP_INDEX_URL:+--index-url "$PIP_INDEX_URL"} 'ansible-core==2.16.14'
-ENV PATH="/opt/ansible/bin:${PATH}"
-
 COPY portal/backend/requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir ${PIP_INDEX_URL:+--index-url "$PIP_INDEX_URL"} \
       -r /tmp/requirements.txt \
  && rm /tmp/requirements.txt
+
+# ansible in its OWN venv, so its jinja2/PyYAML/packaging/resolvelib pins can
+# never fight the app's pinned set. Only ansible-core is required — every
+# module in the four playbooks is `ansible.builtin.*`, so there are no Galaxy
+# collections to install. Floor is 2.13 (ansible.cfg uses `callback_result_format`).
+#
+# Expose ONLY the ansible binaries, by symlink, instead of putting the venv on
+# PATH: the venv's `python` would otherwise shadow the interpreter the app was
+# installed into, and `python -m app.worker` would fail to import fastapi. The
+# symlinked scripts carry a shebang pointing at the venv's interpreter, so they
+# still run fully isolated. `--version` here makes a broken link fail the build
+# rather than the first deployment.
+RUN python -m venv /opt/ansible \
+ && /opt/ansible/bin/pip install --no-cache-dir \
+      ${PIP_INDEX_URL:+--index-url "$PIP_INDEX_URL"} 'ansible-core==2.16.14' \
+ && for b in /opt/ansible/bin/ansible*; do ln -sf "$b" /usr/local/bin/; done \
+ && ansible-playbook --version | head -n 1
 
 # --- the app, plus the terraform/ansible assets it drives ---
 WORKDIR /app
 COPY portal/ /app/portal/
 COPY terraform/ /app/terraform/
 COPY --from=frontend /build/dist /app/portal/frontend/dist
+
+# --- build-time secret guard ----------------------------------------------
+# `portal/.env` is the COMPOSE env (Alibaba Cloud credentials + the JWT signing
+# key); `deploy.sh` creates it before building. It is listed in .dockerignore,
+# but a missing line there fails silently — and the cost of that silence is a
+# credential baked into a shipped layer. So assert its absence positively: if
+# it ever appears here, the build must stop.
+RUN test ! -e /app/portal/.env \
+ || { echo "portal/.env leaked into the build context — refusing to bake credentials" >&2; exit 1; }
 
 # --- build-time assertion -------------------------------------------------
 # The worker runs these by path. Three of the four playbooks are untracked in

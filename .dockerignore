@@ -33,11 +33,18 @@ terraform/.tenants/
 terraform/ansible/inventory/hosts.yml
 
 # --- portal: keep sources, drop deps/build output/local env ---
+# NOTE both env files. `portal/.env` is the COMPOSE env and is created by
+# portal/deploy.sh BEFORE it runs `docker compose build` — so on every run
+# after the first it exists and would be copied into the image by
+# `COPY portal/ /app/portal/`, baking the platform's Alibaba Cloud credentials
+# and the JWT signing key into a layer. The Dockerfile carries a positive
+# build-time guard for this too, because missing one line here is silent.
+portal/.env
+portal/backend/.env
 portal/backend/.venv/
 portal/backend/*.db
 portal/backend/*.db-wal
 portal/backend/*.db-shm
-portal/backend/.env
 portal/frontend/node_modules/
 portal/frontend/dist/
 portal/e2e/node_modules/
@@ -45,6 +52,15 @@ portal/e2e/test-results/
 portal/e2e/playwright-report/
 # netbird artifacts are bind-mounted at runtime, never baked (192 MB + 59 MB)
 portal/artifacts/
+
+# --- deploy/ stack secrets ---
+# Nothing COPYs these, so they cannot reach a layer — but the context is still
+# shipped to the builder, and a remote/buildx builder would receive the
+# operator's Caddy/TLS material and mynet .env.
+deploy/.env
+deploy/certs/
+deploy/images/
+deploy/state/
 
 # --- misc ---
 docs/
