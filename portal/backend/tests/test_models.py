@@ -1,11 +1,10 @@
+from sqlalchemy import select
+
 from app.models import Tenant, User, Deployment, Run
 
 
-def test_tenant_user_deployment_run_roundtrip(client):
-    from app.db import SessionLocal
-    from sqlalchemy import select
-
-    db = SessionLocal()
+def test_tenant_user_deployment_run_roundtrip(db_factory):
+    db = db_factory()
     t = Tenant(name="Acme", slug="acme")
     db.add(t)
     db.commit()
