@@ -1030,15 +1030,36 @@ class Deployer(Protocol):
 
 
 class RealDeployer:
-    def __init__(self, terraform_bin: str = "terraform", ansible_bin: str = "ansible-playbook"):
+    def __init__(
+        self,
+        terraform_bin: str = "terraform",
+        ansible_bin: str = "ansible-playbook",
+        timeout: int = 3600,
+    ):
         self.terraform_bin = terraform_bin
         self.ansible_bin = ansible_bin
+        self.timeout = timeout  # 可注入，便于测试超时路径
 
     def _run(self, cmd: list[str], cwd: str, env: dict[str, str]) -> str:
         import os
 
         merged = {**os.environ, **env}
-        proc = subprocess.run(cmd, cwd=cwd, env=merged, capture_output=True, text=True, timeout=3600)
+        try:
+            proc = subprocess.run(
+                cmd, cwd=cwd, env=merged, capture_output=True, text=True, timeout=self.timeout
+            )
+        except subprocess.TimeoutExpired as e:
+            # 注意：text=True 下 TimeoutExpired.stdout/.stderr 仍是 bytes（或 None）
+            def _text(v) -> str:
+                if v is None:
+                    return ""
+                return v.decode("utf-8", "replace") if isinstance(v, bytes) else v
+
+            raise DeployerError(
+                f"command timed out: {' '.join(cmd)}", _text(e.stdout) + _text(e.stderr)
+            ) from e
+        except OSError as e:
+            raise DeployerError(f"failed to start command: {' '.join(cmd)}: {e}") from e
         out = (proc.stdout or "") + (proc.stderr or "")
         if proc.returncode != 0:
             raise DeployerError(f"command failed: {' '.join(cmd)}", out)
