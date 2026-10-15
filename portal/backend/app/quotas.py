@@ -8,7 +8,7 @@ SUBDOMAIN_RE = re.compile(r"^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$")
 
 def _cidr(s: str) -> ipaddress.IPv4Network:
     try:
-        return ipaddress.ip_network(s, strict=False)
+        return ipaddress.IPv4Network(s, strict=False)
     except ValueError:
         raise ValueError(f"invalid CIDR: {s}")
 

@@ -50,3 +50,16 @@ def test_over_quota_vm_count_rejected():
 def test_running_deployment_blocks_new_one():
     errs = validate_config(valid_config(), {"max_vms": 10, "max_running": 1}, 1)
     assert any("running" in e for e in errs)
+
+
+def test_ipv6_cidr_rejected():
+    cfg = valid_config(
+        public_devices={
+            "cidr": "fd00::/64",
+            "instances": {
+                "bastion": {"host_name": "bastion", "public_ip": True, "is_bastion": True, "domain_name": "bastion"}
+            },
+        }
+    )
+    errs = validate_config(cfg, {"max_vms": 10}, 0)
+    assert errs
