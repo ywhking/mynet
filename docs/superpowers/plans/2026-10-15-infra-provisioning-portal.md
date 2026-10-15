@@ -136,6 +136,7 @@ class Settings(BaseSettings):
 
     terraform_dir: str = "../terraform"
     ansible_dir: str = "../terraform/ansible"
+    inventory_script: str = "../terraform/ansible/inventory/generate_inventory.sh"
 
     worker_max_concurrency: int = 1
     quota_max_vms: int = 10
@@ -952,8 +953,9 @@ git commit -m "feat(portal): generate per-tenant tfvars"
 - Produces: `Deployer`（Protocol）、`RealDeployer`（实现类）、`DeployerError`。方法签名：
   - `terraform_apply(workspace: str, var_file: str, cwd: str, env: dict[str, str]) -> str`
   - `terraform_destroy(workspace: str, var_file: str, cwd: str, env: dict[str, str]) -> str`
-  - `run_ansible(playbook: str, cwd: str, env: dict[str, str]) -> str`
-  - 失败抛 `DeployerError`（含 stdout/stderr），成功返回合并输出。
+  - `generate_inventory(script_path: str, cwd: str, env: dict[str, str]) -> str`（跑 `bash <script_path> --write`，刷新 ansible 静态 inventory）
+  - `run_ansible(playbook: str, cwd: str, env: dict[str, str], extra_args: list[str] | None = None) -> str`
+  - 失败抛 `DeployerError`（含 stdout/stderr），成功返回合并输出。**所有 `subprocess` 级失败（命令不存在/不可执行/超时）也必须转成 `DeployerError`**，不得让 `FileNotFoundError`/`PermissionError`/`TimeoutExpired` 逃逸。`terraform_apply`/`terraform_destroy` 命令链首步为 `terraform init -input=false`。
 
 - [ ] **Step 1: 写失败测试（用假二进制）**
 
@@ -1022,8 +1024,9 @@ class DeployerError(Exception):
 
 class Deployer(Protocol):
     def terraform_apply(self, workspace: str, var_file: str, cwd: str, env: dict[str, str]) -> str: ...
-    def terraform_destroy(self, workspace: str, cwd: str, env: dict[str, str]) -> str: ...
-    def run_ansible(self, playbook: str, cwd: str, env: dict[str, str]) -> str: ...
+    def terraform_destroy(self, workspace: str, var_file: str, cwd: str, env: dict[str, str]) -> str: ...
+    def generate_inventory(self, script_path: str, cwd: str, env: dict[str, str]) -> str: ...
+    def run_ansible(self, playbook: str, cwd: str, env: dict[str, str], extra_args: list[str] | None = None) -> str: ...
 
 
 class RealDeployer:
@@ -1059,8 +1062,13 @@ class RealDeployer:
             cwd, env,
         )
 
-    def run_ansible(self, playbook: str, cwd: str, env: dict[str, str]) -> str:
-        return self._run([self.ansible_bin, playbook], cwd, env)
+    def generate_inventory(self, script_path: str, cwd: str, env: dict[str, str]) -> str:
+        return self._run(["bash", script_path, "--write"], cwd, env)
+
+    def run_ansible(
+        self, playbook: str, cwd: str, env: dict[str, str], extra_args: list[str] | None = None
+    ) -> str:
+        return self._run([self.ansible_bin, playbook, *(extra_args or [])], cwd, env)
 ```
 
 - [ ] **Step 4: 运行确认通过**
@@ -1116,8 +1124,14 @@ class FakeDeployer:
         self.calls.append("destroy")
         return "destroyed"
 
-    def run_ansible(self, playbook, cwd, env):
+    def generate_inventory(self, script_path, cwd, env):
+        self.calls.append("inventory")
+        return "inventory written"
+
+    def run_ansible(self, playbook, cwd, env, extra_args=None):
         self.calls.append(playbook)
+        if extra_args:
+            self.calls.append(" ".join(extra_args))
         return f"ran {playbook}"
 
 
@@ -1148,7 +1162,10 @@ def test_execute_create_marks_succeeded(db_factory):
     r = db.query(Run).get(run_id)
     assert r.status == "succeeded"
     assert "applied" in r.log
-    assert "setup-network" in " ".join(fake.calls)
+    joined = " ".join(fake.calls)
+    assert "setup-network" in joined
+    assert "inventory" in fake.calls  # generate_inventory 必须在 playbook 之前跑
+    assert "netbird_letsencrypt_email=" in joined  # setup-netbird.yml 必需的 extra var
     db.close()
 
 
@@ -1194,7 +1211,13 @@ from .schemas import DeploymentConfig
 
 logger = logging.getLogger("portal.runner")
 
-PLAYBOOKS = ["setup-network.yml", "setup-docker.yml", "setup-netbird.yml", "setup-netbird-agent.yml"]
+# 必须以 playbooks/ 前缀调用（cwd = settings.ansible_dir，ansible.cfg 在其中）
+PLAYBOOKS = [
+    "playbooks/setup-network.yml",
+    "playbooks/setup-docker.yml",
+    "playbooks/setup-netbird.yml",
+    "playbooks/setup-netbird-agent.yml",
+]
 
 
 def utcnow() -> datetime:
@@ -1248,9 +1271,18 @@ def execute_run(run_id: int, deployer: Deployer, session_factory) -> None:
             out = deployer.terraform_apply(tenant.slug, var_file, settings.terraform_dir, env)
             _append_log(run, out, db)
 
+            # spec §8 步骤 4：刷新静态 inventory，否则 ansible 会打到过期/不存在的 hosts.yml
+            _append_log(run, "==> generate_inventory.sh --write", db)
+            out = deployer.generate_inventory(settings.inventory_script, settings.ansible_dir, env)
+            _append_log(run, out, db)
+
             for playbook in PLAYBOOKS:
+                extra: list[str] = []
+                if playbook.endswith("setup-netbird.yml"):
+                    # setup-netbird.yml 要求 netbird_letsencrypt_email（见 terraform/deploy-all.sh:162）
+                    extra = ["-e", f"netbird_letsencrypt_email={settings.netbird_letsencrypt_email}"]
                 _append_log(run, f"==> ansible-playbook {playbook}", db)
-                out = deployer.run_ansible(playbook, settings.ansible_dir, env)
+                out = deployer.run_ansible(playbook, settings.ansible_dir, env, extra)
                 _append_log(run, out, db)
 
         run.status = "succeeded"
@@ -1282,6 +1314,7 @@ def worker_loop(session_factory, deployer: Deployer, max_concurrency: int = 1) -
         try:
             execute_run(run_id, deployer, session_factory)
         finally:
+            active.discard(run_id)  # 必须清理，否则 active 只增不减，处理完 N 个后再也不分发
             semaphore.release()
 
     while True:
