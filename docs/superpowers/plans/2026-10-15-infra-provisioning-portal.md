@@ -1530,6 +1530,23 @@ def get_deployment(dep_id: int, user: User = Depends(get_current_user), db: Sess
 @router.post("/{dep_id}/destroy")
 def destroy_deployment(dep_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     dep = _owned_deployment(db, dep_id, user)
+
+    # 只在确定无可销毁之物时拒绝：允许 succeeded / failed（失败可能残留真实资源，
+    # 必须让租户能清理，否则会留下持续计费的孤儿资源）
+    in_flight = (
+        db.query(Run)
+        .filter(
+            Run.deployment_id == dep.id,
+            Run.type.in_(["create", "destroy"]),
+            Run.status.in_(["pending", "running"]),
+        )
+        .first()
+    )
+    if in_flight is not None:
+        raise HTTPException(status_code=400, detail=f"{in_flight.type} already in progress")
+    if dep.status in ("draft", "destroyed"):
+        raise HTTPException(status_code=400, detail="nothing to destroy")
+
     run = Run(deployment_id=dep.id, type="destroy", status="pending")
     db.add(run)
     db.commit()
