@@ -36,3 +36,31 @@ def test_run_ansible_passes_playbook(tmp_path):
     d = RealDeployer(terraform_bin="/bin/echo", ansible_bin=str(fake))
     out = d.run_ansible("setup-docker.yml", "/tmp", {})
     assert "playbook=setup-docker.yml" in out
+
+
+def test_terraform_missing_binary_raises_deployer_error():
+    d = RealDeployer(terraform_bin="/nonexistent/terraform-nope", ansible_bin="/bin/echo")
+    with pytest.raises(DeployerError):
+        d.terraform_apply("acme", "/tmp/x.tfvars", "/tmp", {})
+
+
+def test_terraform_apply_includes_init(tmp_path):
+    cmdfile = tmp_path / "cmds.txt"
+    fake = tmp_path / "terraform"
+    _write_exec(str(fake), '#!/bin/sh\necho "$@" >> "$CMDFILE"\nexit 0\n')
+    d = RealDeployer(terraform_bin=str(fake), ansible_bin="/bin/echo")
+    d.terraform_apply("acme", "/tmp/x.tfvars", "/tmp", {"CMDFILE": str(cmdfile)})
+    recorded = cmdfile.read_text().splitlines()
+    assert recorded[0].startswith("init")
+    assert any(line.startswith("workspace select") for line in recorded)
+
+
+def test_terraform_destroy_includes_init(tmp_path):
+    cmdfile = tmp_path / "cmds.txt"
+    fake = tmp_path / "terraform"
+    _write_exec(str(fake), '#!/bin/sh\necho "$@" >> "$CMDFILE"\nexit 0\n')
+    d = RealDeployer(terraform_bin=str(fake), ansible_bin="/bin/echo")
+    d.terraform_destroy("acme", "/tmp/x.tfvars", "/tmp", {"CMDFILE": str(cmdfile)})
+    recorded = cmdfile.read_text().splitlines()
+    assert recorded[0].startswith("init")
+    assert any(line.startswith("destroy") for line in recorded)

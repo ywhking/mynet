@@ -25,7 +25,15 @@ class RealDeployer:
         import os
 
         merged = {**os.environ, **env}
-        proc = subprocess.run(cmd, cwd=cwd, env=merged, capture_output=True, text=True, timeout=3600)
+        try:
+            proc = subprocess.run(cmd, cwd=cwd, env=merged, capture_output=True, text=True, timeout=3600)
+        except subprocess.TimeoutExpired as e:
+            raise DeployerError(
+                f"command timed out: {' '.join(cmd)}",
+                (e.stdout or "") + (e.stderr or ""),
+            ) from e
+        except OSError as e:
+            raise DeployerError(f"failed to start command: {' '.join(cmd)}: {e}") from e
         out = (proc.stdout or "") + (proc.stderr or "")
         if proc.returncode != 0:
             raise DeployerError(f"command failed: {' '.join(cmd)}", out)
@@ -33,6 +41,9 @@ class RealDeployer:
 
     def terraform_apply(self, workspace: str, var_file: str, cwd: str, env: dict[str, str]) -> str:
         return self._run(
+            [self.terraform_bin, "init", "-input=false"],
+            cwd, env,
+        ) + self._run(
             [self.terraform_bin, "workspace", "select", "-or-create", workspace],
             cwd, env,
         ) + self._run(
@@ -42,6 +53,9 @@ class RealDeployer:
 
     def terraform_destroy(self, workspace: str, var_file: str, cwd: str, env: dict[str, str]) -> str:
         return self._run(
+            [self.terraform_bin, "init", "-input=false"],
+            cwd, env,
+        ) + self._run(
             [self.terraform_bin, "workspace", "select", "-or-create", workspace],
             cwd, env,
         ) + self._run(
