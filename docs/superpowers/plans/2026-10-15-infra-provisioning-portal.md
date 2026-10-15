@@ -15,7 +15,7 @@
 - 软件栈固定为 NetBird VPN + Docker，不做自定义应用/应用目录（spec §2）。
 - 所有阿里云资源部署在平台方统一账号，每租户一个资源组，名称 `mynet-<slug>`（spec §7）。
 - 每租户一个 terraform workspace，state 落在 `terraform.tfstate.d/<workspace>/`（spec §7）。
-- Worker 全局并发上限默认 2（spec §5）；每租户同时运行中的部署上限默认 1（spec §9）。
+- Worker 全局并发上限默认 **1（串行）**；每租户同时运行中的部署上限默认 1（spec §9）。**注意：不复用 spec §5 的"并发 2"**——所有租户共用同一个 `settings.terraform_dir`，而 `terraform workspace select` 会写该目录下共享的 `.terraform/environment`；并发时 A 租户的 `apply` 可能落到 B 的 workspace（错改/错删他人基础设施）。spec §3 已说明"并发部署极少"，串行无成本损失。若要恢复并发，须先改为每租户独立 terraform 工作目录。
 - 每租户最大 VM 数默认 10（spec §9）。
 - 域名用平台通配子域名：`<subdomain>.<PLATFORM_DOMAIN>`（spec §7）。
 - 阿里云 AccessKey / DNS 凭据只存服务端环境变量，任何 API 不返回（spec §9）。
@@ -137,7 +137,7 @@ class Settings(BaseSettings):
     terraform_dir: str = "../terraform"
     ansible_dir: str = "../terraform/ansible"
 
-    worker_max_concurrency: int = 2
+    worker_max_concurrency: int = 1
     quota_max_vms: int = 10
     quota_max_running_deployments: int = 1
 
@@ -1271,7 +1271,7 @@ def execute_run(run_id: int, deployer: Deployer, session_factory) -> None:
         db.close()
 
 
-def worker_loop(session_factory, deployer: Deployer, max_concurrency: int = 2) -> None:
+def worker_loop(session_factory, deployer: Deployer, max_concurrency: int = 1) -> None:
     import threading
 
     semaphore = threading.Semaphore(max_concurrency)
