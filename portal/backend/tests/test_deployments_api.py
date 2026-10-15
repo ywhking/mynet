@@ -110,53 +110,139 @@ def _create_dep(client, email):
     return token, dep_id
 
 
+def _set_run_status(client, dep_id, run_type, status):
+    db = _db(client)
+    try:
+        db.query(Run).filter(Run.deployment_id == dep_id, Run.type == run_type).first().status = status
+        db.commit()
+    finally:
+        db.close()
+
+
+def _mark_deployed(client, dep_id):
+    """把部署置为"create 已跑完且成功"：create run 终态 + status=succeeded。
+
+    真实流程里只有 create run 结束后才是这个状态。这些用例必须先把在途 create
+    run 收尾，否则会先被守卫 2（create 在途）挡下，守卫 1/3 就失去了覆盖。
+    """
+    _set_run_status(client, dep_id, "create", "succeeded")
+    _set_status(client, dep_id, "succeeded")
+
+
 def test_destroy_rejected_when_not_deployed(client):
-    """从未成功创建过基础设施（status="draft"）的部署不能销毁。"""
+    """draft 且无在途 run → 确定无物可销毁。"""
     token, dep_id = _create_dep(client, "d1@acme.com")
+    _set_run_status(client, dep_id, "create", "succeeded")  # 隔离守卫 3
 
     r = client.post(f"/api/deployments/{dep_id}/destroy", headers=_auth(token))
     assert r.status_code == 400
-    assert "succeeded" in r.json()["detail"]
+    assert "nothing to destroy" in r.json()["detail"]
+    assert _destroy_runs(client, dep_id) == []
+
+
+def test_destroy_rejected_when_create_in_flight(client):
+    """create 还在跑时不能销毁 —— 不能一边建一边删。"""
+    token, dep_id = _create_dep(client, "d5@acme.com")  # 刚创建 → create run 为 pending
+
+    # 断言"拒绝的原因是在途 create"，而不是只断言 400：否则守卫 3 也能让这个用例变绿，
+    # 用例就失去意义了。措辞不锁死（"create in progress" / "create already in progress" 都算）。
+    r = client.post(f"/api/deployments/{dep_id}/destroy", headers=_auth(token))
+    assert r.status_code == 400
+    assert "create" in r.json()["detail"] and "progress" in r.json()["detail"]
+
+    _set_run_status(client, dep_id, "create", "running")
+    r2 = client.post(f"/api/deployments/{dep_id}/destroy", headers=_auth(token))
+    assert r2.status_code == 400
+    assert "create" in r2.json()["detail"] and "progress" in r2.json()["detail"]
+
+    assert _destroy_runs(client, dep_id) == []
+
+
+def test_destroy_rejected_when_already_destroyed(client):
+    """已销毁的部署无物可销毁（否则会反复对空 state 跑 terraform destroy）。"""
+    token, dep_id = _create_dep(client, "d6@acme.com")
+    _mark_deployed(client, dep_id)
+    _set_status(client, dep_id, "destroyed")
+
+    r = client.post(f"/api/deployments/{dep_id}/destroy", headers=_auth(token))
+    assert r.status_code == 400
+    assert "nothing to destroy" in r.json()["detail"]
     assert _destroy_runs(client, dep_id) == []
 
 
 def test_destroy_rejected_when_destroy_already_pending(client):
     """重复 POST destroy 不能堆积 run —— 每个都会对已销毁的 state 再跑一次。"""
     token, dep_id = _create_dep(client, "d2@acme.com")
-    _set_status(client, dep_id, "succeeded")
+    _mark_deployed(client, dep_id)
 
     first = client.post(f"/api/deployments/{dep_id}/destroy", headers=_auth(token))
     assert first.status_code == 200
 
     second = client.post(f"/api/deployments/{dep_id}/destroy", headers=_auth(token))
     assert second.status_code == 400
+    assert "destroy" in second.json()["detail"] and "progress" in second.json()["detail"]
     assert len(_destroy_runs(client, dep_id)) == 1
 
 
 def test_destroy_rejected_when_destroy_running(client):
     """已在执行中的 destroy run 同样要挡住重复入队（status="running" 也要覆盖）。"""
     token, dep_id = _create_dep(client, "d3@acme.com")
-    _set_status(client, dep_id, "succeeded")
+    _mark_deployed(client, dep_id)
 
     assert client.post(f"/api/deployments/{dep_id}/destroy", headers=_auth(token)).status_code == 200
+    _set_run_status(client, dep_id, "destroy", "running")
 
-    db = _db(client)
-    try:
-        db.query(Run).filter(Run.deployment_id == dep_id, Run.type == "destroy").first().status = "running"
-        db.commit()
-    finally:
-        db.close()
-
-    assert client.post(f"/api/deployments/{dep_id}/destroy", headers=_auth(token)).status_code == 400
+    r = client.post(f"/api/deployments/{dep_id}/destroy", headers=_auth(token))
+    assert r.status_code == 400
+    assert "destroy" in r.json()["detail"] and "progress" in r.json()["detail"]
     assert len(_destroy_runs(client, dep_id)) == 1
 
 
 def test_destroy_allowed_when_deployed(client):
     """正向路径：已成功创建的部署可以销毁（守卫不能把正常用例也挡掉）。"""
     token, dep_id = _create_dep(client, "d4@acme.com")
-    _set_status(client, dep_id, "succeeded")
+    _mark_deployed(client, dep_id)
 
     r = client.post(f"/api/deployments/{dep_id}/destroy", headers=_auth(token))
     assert r.status_code == 200
     assert r.json()["status"] == "pending"
-    assert len(_destroy_runs(client, dep_id)) == 1
+    runs = _destroy_runs(client, dep_id)
+    assert len(runs) == 1
+    assert runs[0].status == "pending"
+
+
+def test_destroy_allowed_when_deployment_failed(client):
+    """create 失败（terraform apply 半途失败）会残留真实云资源，必须允许 destroy 清理。
+
+    若守卫只放行 "succeeded"，失败部署就再无任何 API 路径清理资源
+    （retry 只处理失败的 create run），孤儿资源会持续计费。
+    """
+    token, dep_id = _create_dep(client, "d7@acme.com")
+    _set_run_status(client, dep_id, "create", "failed")
+    _set_status(client, dep_id, "failed")
+
+    r = client.post(f"/api/deployments/{dep_id}/destroy", headers=_auth(token))
+    assert r.status_code == 200
+    assert r.json()["status"] == "pending"
+    runs = _destroy_runs(client, dep_id)
+    assert len(runs) == 1
+    assert runs[0].status == "pending"
+
+
+def test_destroy_allowed_after_failed_destroy(client):
+    """destroy 自身失败后必须能再次 destroy —— 否则租户永久无法清理残留资源。
+
+    create 成功 → destroy 允许 → destroy 跑一半失败（部署回到 "failed"）
+    → 再次 POST destroy 必须 200，而不是被守卫永久 400 挡死。
+    """
+    token, dep_id = _create_dep(client, "d8@acme.com")
+    _mark_deployed(client, dep_id)
+
+    assert client.post(f"/api/deployments/{dep_id}/destroy", headers=_auth(token)).status_code == 200
+    _set_run_status(client, dep_id, "destroy", "failed")
+    _set_status(client, dep_id, "failed")
+
+    again = client.post(f"/api/deployments/{dep_id}/destroy", headers=_auth(token))
+    assert again.status_code == 200
+    assert again.json()["status"] == "pending"
+    assert len(_destroy_runs(client, dep_id)) == 2

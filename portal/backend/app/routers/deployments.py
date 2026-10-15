@@ -74,24 +74,32 @@ def get_deployment(dep_id: int, user: User = Depends(get_current_user), db: Sess
 def destroy_deployment(dep_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     dep = _owned_deployment(db, dep_id, user)
 
-    # 重复 POST 会堆积 destroy run，每个都对已销毁的 state 再跑一次 terraform destroy
-    active = (
+    # 只拒绝"确定不可销毁"的情况。教训：若只放行 status == "succeeded"，一次失败的
+    # destroy 会把部署置为 "failed"，此后 destroy 一律被拒，而 retry 只处理失败的
+    # create run —— 租户就再也没有任何 API 路径去清理 terraform 已经建了一半的真实
+    # 云资源，只能看着它持续计费。所以 "failed" 必须放行。
+
+    # 1) 已有 destroy 在途 → 拒绝（幂等，避免重复入队把 run 堆积起来）
+    in_flight_destroy = (
         db.query(Run)
         .filter(Run.deployment_id == dep.id, Run.type == "destroy", Run.status.in_(["pending", "running"]))
         .first()
     )
-    if active is not None:
-        raise HTTPException(
-            status_code=400, detail=f"A destroy run is already {active.status} for this deployment"
-        )
+    if in_flight_destroy is not None:
+        raise HTTPException(status_code=400, detail="destroy already in progress")
 
-    # "succeeded" 是"存在成功创建的基础设施"的唯一标志（见 runner 的终态映射：
-    # destroy 成功会把它推进到 "destroyed"），所以 draft/failed/destroyed 都不该被销毁
-    if dep.status != "succeeded":
-        raise HTTPException(
-            status_code=400,
-            detail=f"Nothing to destroy: deployment status is {dep.status!r}, expected 'succeeded'",
-        )
+    # 2) 已有 create 在途 → 拒绝（不要一边建一边销毁）
+    in_flight_create = (
+        db.query(Run)
+        .filter(Run.deployment_id == dep.id, Run.type == "create", Run.status.in_(["pending", "running"]))
+        .first()
+    )
+    if in_flight_create is not None:
+        raise HTTPException(status_code=400, detail="create in progress; wait for it to finish")
+
+    # 3) 已销毁（或从未创建）→ 无物可销毁
+    if dep.status in ("draft", "destroyed"):
+        raise HTTPException(status_code=400, detail="nothing to destroy")
 
     run = Run(deployment_id=dep.id, type="destroy", status="pending")
     db.add(run)
