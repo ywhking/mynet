@@ -14,8 +14,12 @@ class Settings(BaseSettings):
 
     terraform_dir: str = "../terraform"
     ansible_dir: str = "../terraform/ansible"
+    inventory_script: str = "../terraform/ansible/inventory/generate_inventory.sh"
 
-    worker_max_concurrency: int = 2
+    alicloud_access_key: str = ""
+    alicloud_secret_key: str = ""
+
+    worker_max_concurrency: int = 1
     quota_max_vms: int = 10
     quota_max_running_deployments: int = 1
 
