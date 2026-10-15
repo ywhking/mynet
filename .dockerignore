@@ -1,0 +1,58 @@
+# Build context is the REPO ROOT (`docker build -f portal/Dockerfile .`),
+# because the portal image bakes `terraform/` + `terraform/ansible/`, which
+# live outside `portal/`. Keep the context small and keep secrets out.
+#
+# NOTE: `build.sh` builds the three submodule images with the *submodule* as
+# context, so nothing here affects those builds.
+
+# --- VCS ---
+.git
+.gitmodules
+
+# --- Submodules (huge, not needed by the portal image) ---
+headscale/
+headplane/
+tailscale/
+tailscale-wincli/
+
+# --- terraform: keep the MODULE (portal bakes *.tf + scripts/ + ansible/),
+#     drop everything that is state, secrets, cache or generated ---
+terraform/.terraform/
+terraform/keys/
+terraform/*.tfstate
+terraform/*.tfstate.*
+terraform/terraform.tfvars
+terraform/*.tfvars
+!terraform/terraform.tfvars.example
+terraform/plan.out
+terraform/.terraform.lock.hcl
+terraform/accesskey.txt
+terraform/logs/
+terraform/.claude/
+terraform/.tenants/
+terraform/ansible/inventory/hosts.yml
+
+# --- portal: keep sources, drop deps/build output/local env ---
+portal/backend/.venv/
+portal/backend/*.db
+portal/backend/*.db-wal
+portal/backend/*.db-shm
+portal/backend/.env
+portal/frontend/node_modules/
+portal/frontend/dist/
+portal/e2e/node_modules/
+portal/e2e/test-results/
+portal/e2e/playwright-report/
+# netbird artifacts are bind-mounted at runtime, never baked (192 MB + 59 MB)
+portal/artifacts/
+
+# --- misc ---
+docs/
+logs/
+.playwright-mcp/
+.superpowers/
+.claude/
+**/*.Zone.Identifier
+**/__pycache__/
+**/*.pyc
+**/*.retry

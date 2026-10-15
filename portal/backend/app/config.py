@@ -44,6 +44,13 @@ class Settings(BaseSettings):
     # Relative to ansible_dir (the cwd the playbooks and inventory script run in).
     inventory_script: str = "inventory/generate_inventory.sh"
 
+    # Built SPA bundle, served by the API so the app stays same-origin: the
+    # frontend calls /api with relative paths and no CORS is configured.
+    # Relative to the backend cwd, so the default resolves to
+    # portal/frontend/dist both locally and inside the image
+    # (/app/portal/frontend/dist).
+    frontend_dist: str = "../frontend/dist"
+
     alicloud_access_key: str = ""
     alicloud_secret_key: str = ""
 

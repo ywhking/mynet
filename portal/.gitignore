@@ -1,0 +1,8 @@
+# Docker Compose environment for the portal stack — holds the platform's
+# Alibaba Cloud credentials and the JWT signing secret. Template: .env.example
+/.env
+
+# NetBird install artifacts (offline install tarball + client binary). They are
+# large (192 MB + 59 MB) and are bind-mounted into the worker at runtime rather
+# than baked into the image — see portal/docker-compose.yml.
+/artifacts/
