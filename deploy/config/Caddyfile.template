@@ -36,3 +36,9 @@ __LISTEN__ {
 		format json
 	}
 }
+
+# --- Portal 部署门户（可选）---
+# 由 install.sh 依据 deploy/.env 的 PORTAL_DOMAIN 生成 —— 留空则整块不生成。
+# 需要 portal/ 那套栈已启动并加入本栈的 mynet 网络（容器名 portal-api，
+# 它自己不分发 80/443，也不需要单独的 Caddy）。
+__PORTAL_SITE__

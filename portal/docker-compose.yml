@@ -1,0 +1,102 @@
+# The portal stack: API + worker.
+#
+# There is deliberately no web/TLS service here. The portal is meant to sit
+# behind the Caddy that `deploy/` already runs (it owns host 80/443), so this
+# stack publishes no public ports and joins that stack's external network —
+# the existing Caddy reaches the app as `portal-api:8000`.
+#
+# Build context is the REPO ROOT (`context: ..`), because the image bakes the
+# `terraform/` + `terraform/ansible/` assets the worker drives.
+#
+#   cd portal && cp .env.example .env && ./deploy.sh
+
+name: portal
+
+x-api: &api
+  build:
+    context: ..
+    dockerfile: portal/Dockerfile
+    target: api
+    args:
+      # Mainland-China build mirrors; empty = the default registries.
+      NPM_REGISTRY: ${NPM_REGISTRY:-}
+      PIP_INDEX_URL: ${PIP_INDEX_URL:-}
+  image: portal-api:local
+  env_file: .env
+  environment:
+    # All paths the app resolves are relative to its cwd, so they are pinned
+    # here rather than left to the image's layout. `environment:` outranks
+    # `env_file`, so a stale value in the operator's .env cannot win.
+    TERRAFORM_DIR: /app/terraform          # baked, read-only source of *.tf + scripts/
+    TENANTS_DIR: /data/tenants             # writable volume — must NOT sit inside
+                                           # /app/terraform, which is image-owned
+    ANSIBLE_DIR: /app/terraform/ansible    # cwd for every playbook + the inventory script
+    INVENTORY_SCRIPT: inventory/generate_inventory.sh
+    FRONTEND_DIST: /app/portal/frontend/dist
+    # Two writers (API + worker) share one SQLite file; `timeout` is passed
+    # through to sqlite3.connect and softens "database is locked".
+    DATABASE_URL: sqlite:////data/db/portal.db?timeout=30
+  networks: [mynet]
+
+services:
+  api:
+    <<: *api
+    container_name: portal-api
+    restart: unless-stopped
+    volumes:
+      - portal_db:/data/db
+    ports:
+      # Loopback-only debugging port. Not the public entry point — the existing
+      # Caddy serves the domain and reaches this container over `mynet`.
+      - "${API_DEBUG_BIND:-127.0.0.1}:${API_DEBUG_PORT:-18000}:8000"
+    healthcheck:
+      # `GET /api/health` can only answer after the startup hook has run, so a
+      # 200 also proves `create_all` created the schema. The worker's gate below
+      # depends on exactly that. Uses the stdlib, not curl, which the image
+      # does not ship.
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import sys, urllib.request
+          sys.exit(0 if urllib.request.urlopen("http://127.0.0.1:8000/api/health", timeout=2).status == 200 else 1)
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 20s
+
+  worker:
+    <<: *api
+    container_name: portal-worker
+    # `app.worker` exists so this is not a four-import `python -c` one-liner.
+    command: ["python", "-m", "app.worker"]
+    # NOT unless-stopped: a genuinely invalid config makes
+    # validate_runtime_settings raise on every start, which would loop forever
+    # and bury the error. on-failure gives a bounded, visible failure.
+    restart: on-failure
+    depends_on:
+      api:
+        # Without this the worker polls before the schema exists. It does not
+        # crash (it swallows the error), it just spins uselessly — the worst
+        # kind of failure.
+        condition: service_healthy
+    volumes:
+      - portal_db:/data/db
+      - portal_tenants:/data/tenants
+      # The NetBird offline package (192 MB) and client binary (59 MB) are
+      # Ansible `copy` sources, resolved on the CONTROL node = this container.
+      # They are mounted rather than baked so they can be swapped without a
+      # rebuild. NETBIRD_PACKAGE / NETBIRD_BINARY in .env must point at the
+      # *container* paths (/artifacts/...).
+      - ./artifacts:/artifacts:ro
+
+volumes:
+  portal_db:
+  portal_tenants:
+
+networks:
+  # Created by the `deploy/` stack. `portal/deploy.sh` checks for it and says so
+  # rather than letting compose fail with "network mynet ... could not be found".
+  mynet:
+    external: true

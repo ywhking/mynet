@@ -127,6 +127,23 @@ prepare_caddyfile() {
     # 从模板复制后替换（确保每次 install 都使用最新配置）
     cp "$template" "$caddyfile"
     sed -i "s|__LISTEN__|${listen_addr}|" "$caddyfile"
+
+    # Portal 站点块：PORTAL_DOMAIN 非空才生成。portal/ 那套栈不发布公网端口，
+    # 它加入本栈的 mynet 网络后，由这里的 Caddy 按容器名反代过去。
+    # 用「把文件插入标记行」的写法而不是把多行内容塞进 sed 替换串——
+    # 后者要处理换行与 | 转义，很容易出错。
+    if [ -n "${PORTAL_DOMAIN:-}" ]; then
+        local portal_block
+        portal_block="$(mktemp)"
+        printf '%s {\n\treverse_proxy portal-api:8000\n}\n' "$PORTAL_DOMAIN" > "$portal_block"
+        sed -i -e "/__PORTAL_SITE__/r ${portal_block}" -e "/__PORTAL_SITE__/d" "$caddyfile"
+        rm -f "$portal_block"
+        info "已生成 Portal 站点块: ${PORTAL_DOMAIN} → portal-api:8000"
+    else
+        sed -i "/__PORTAL_SITE__/d" "$caddyfile"
+        info "未设置 PORTAL_DOMAIN，跳过 Portal 站点块"
+    fi
+
     info "Caddyfile 已就绪"
 }
 
@@ -252,15 +269,25 @@ _issue_cert() {
     fi
 
     # 检查 acme.sh 内部存储是否已有该域名证书（如已签发过则直接导出，无需重新走 --issue 流程）
+    # 注意：不仅要检查目录存在，还要确认 fullchain.cer 文件完整（之前签发异常中断可能导致目录存在但文件缺失）
     local acme_cert_dir="${HOME}/.acme.sh/${domain}_ecc"
     local acme_cert_dir_rsa="${HOME}/.acme.sh/${domain}"
-    if [ -d "$acme_cert_dir" ] || [ -d "$acme_cert_dir_rsa" ]; then
+    local acme_fullchain=""
+    if [ -f "${acme_cert_dir}/fullchain.cer" ]; then
+        acme_fullchain="${acme_cert_dir}/fullchain.cer"
+    elif [ -f "${acme_cert_dir_rsa}/fullchain.cer" ]; then
+        acme_fullchain="${acme_cert_dir_rsa}/fullchain.cer"
+    fi
+
+    if [ -n "$acme_fullchain" ]; then
         info "  ${domain}: acme.sh 已有证书，直接导出到 certs/..."
+        # 用 || true 防止 acme.sh 内部异常（如证书文件不完整）导致 set -e 终止脚本，
+        # 确保能进入下面的 fallback 重新签发逻辑
         "$acme_sh" --install-cert -d "$domain" \
             --key-file       "${certs_dir}/${domain}.key" \
-            --fullchain-file "${certs_dir}/${domain}.fullchain.pem"
-        cp "${certs_dir}/${domain}.fullchain.pem" "$cert_file"
-        if [ -f "${certs_dir}/${domain}.key" ]; then
+            --fullchain-file "${certs_dir}/${domain}.fullchain.pem" || true
+        if [ -f "${certs_dir}/${domain}.fullchain.pem" ] && [ -f "${certs_dir}/${domain}.key" ]; then
+            cp "${certs_dir}/${domain}.fullchain.pem" "$cert_file"
             return 0
         fi
         warn "  ${domain}: 导出失败，尝试重新签发..."

@@ -236,6 +236,14 @@ else
     DNS_API_CREDENTIALS=""
 fi
 
+# ─── PORTAL_DOMAIN (可选 — 部署 portal 门户时才有) ───
+echo ""
+info "Portal 部署门户（可选）"
+echo "  若已部署 portal/ 那套栈（API + worker 容器，网络名 mynet），填上它的域名，"
+echo "  install.sh 会在 Caddyfile 里加一个反代到 portal-api:8000 的站点块。"
+echo "  留空则不生成任何 portal 配置。"
+read -r -p "  Portal 域名 (留空跳过): " PORTAL_DOMAIN
+
 # ─── INSTALL_PATH ───
 echo ""
 info "安装路径设置"
@@ -270,6 +278,8 @@ ACME_EMAIL=${ACME_EMAIL:-}
 DNS_API_PROVIDER=${DNS_API_PROVIDER:-}
 DNS_API_CREDENTIALS=${DNS_API_CREDENTIALS:-}
 INSTALL_PATH=${INSTALL_PATH}
+# Portal 部署门户（可选 — 留空则不在 Caddyfile 里生成 portal 站点块）
+PORTAL_DOMAIN=${PORTAL_DOMAIN:-}
 EOF
 
 info ".env 文件已生成"
