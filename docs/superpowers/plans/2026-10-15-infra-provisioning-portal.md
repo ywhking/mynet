@@ -314,6 +314,15 @@ def client():
     with TestClient(app) as c:
         yield c
     os.unlink(path)
+
+
+@pytest.fixture
+def db_factory(tmp_path):
+    test_engine = create_engine(
+        f"sqlite:///{tmp_path}/test.db", connect_args={"check_same_thread": False}
+    )
+    Base.metadata.create_all(bind=test_engine)
+    return sessionmaker(bind=test_engine, autoflush=False, autocommit=False)
 ```
 
 - [ ] **Step 7: 写模型测试**
@@ -1247,7 +1256,7 @@ def execute_run(run_id: int, deployer: Deployer, session_factory) -> None:
         run.status = "succeeded"
         db.commit()
     except DeployerError as e:
-        _append_log(run, f"ERROR: {e}", db)
+        _append_log(run, f"ERROR: {e}\n{e.output}", db)
         run.error = str(e)
         run.status = "failed"
         db.commit()
@@ -1384,7 +1393,6 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from ..db import get_db
-from ..deployer import RealDeployer
 from ..models import Deployment, Run, User
 from ..quotas import validate_config
 from ..schemas import DeploymentConfig
