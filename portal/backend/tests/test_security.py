@@ -1,6 +1,9 @@
 import pytest
 from fastapi import HTTPException
 
+import jwt
+
+from app.config import get_settings
 from app.security import (
     hash_password,
     verify_password,
@@ -24,3 +27,11 @@ def test_token_roundtrip():
 def test_decode_invalid_token_raises():
     with pytest.raises(HTTPException):
         decode_token("not-a-token")
+
+
+def test_decode_token_missing_sub_raises_401():
+    s = get_settings()
+    token = jwt.encode({"exp": 9999999999}, s.jwt_secret_key, algorithm=s.jwt_algorithm)
+    with pytest.raises(HTTPException) as exc_info:
+        decode_token(token)
+    assert exc_info.value.status_code == 401
