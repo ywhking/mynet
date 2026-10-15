@@ -134,9 +134,10 @@ class Settings(BaseSettings):
     alicloud_region: str = "cn-wulanchabu"
     vswitch_zone: str = "cn-wulanchabu-a"
 
-    terraform_dir: str = "../terraform"
-    ansible_dir: str = "../terraform/ansible"
-    inventory_script: str = "../terraform/ansible/inventory/generate_inventory.sh"
+    # 相对路径按文档化启动目录 portal/backend 解析（见 README）；运维可用 .env 覆盖
+    terraform_dir: str = "../../terraform"
+    ansible_dir: str = "../../terraform/ansible"
+    inventory_script: str = "inventory/generate_inventory.sh"  # 相对于 ansible_dir
 
     worker_max_concurrency: int = 1
     quota_max_vms: int = 10
@@ -1084,7 +1085,10 @@ class RealDeployer:
         )
 
     def generate_inventory(self, script_path: str, cwd: str, env: dict[str, str]) -> str:
-        return self._run(["bash", script_path, "--write"], cwd, env)
+        import os
+        # bash 按子进程 cwd 解析脚本路径，故相对路径须先与 cwd 拼接
+        path = script_path if os.path.isabs(script_path) else os.path.join(cwd, script_path)
+        return self._run(["bash", path, "--write"], cwd, env)
 
     def run_ansible(
         self, playbook: str, cwd: str, env: dict[str, str], extra_args: list[str] | None = None
@@ -1271,10 +1275,10 @@ def execute_run(run_id: int, deployer: Deployer, session_factory) -> None:
     run.started_at = utcnow()
     db.commit()
 
-    deployment = run.deployment
-    tenant = db.query(Tenant).get(deployment.tenant_id)
-
     try:
+        # deployment/tenant 的解析必须在 try 内：否则解析失败会让 run 永远卡在 running
+        deployment = run.deployment
+        tenant = db.query(Tenant).get(deployment.tenant_id)
         config = DeploymentConfig(**deployment.config)
         tfvars_content = generate_tfvars(config, tenant.slug, settings)
 
@@ -1339,14 +1343,22 @@ def worker_loop(session_factory, deployer: Deployer, max_concurrency: int = 1) -
             semaphore.release()
 
     while True:
-        db = session_factory()
-        pending = db.query(Run).filter(Run.status == "pending").all()
-        db.close()
-        for run in pending:
-            if run.id not in active and len(active) < max_concurrency:
-                active.add(run.id)
-                t = threading.Thread(target=_dispatch, args=(run.id,))
-                t.start()
+        try:
+            db = session_factory()
+            pending = db.query(Run).filter(Run.status == "pending").all()
+            ids = [r.id for r in pending]  # 先取出 id，避免 close 后访问 detached 对象
+            db.close()
+            for run_id in ids:
+                if run_id not in active and len(active) < max_concurrency:
+                    active.add(run_id)
+                    try:
+                        threading.Thread(target=_dispatch, args=(run_id,)).start()
+                    except Exception:  # noqa: BLE001
+                        active.discard(run_id)  # 启动失败必须归还槽位，否则该 run 永不重试
+                        raise
+        except Exception:  # noqa: BLE001
+            # 单次瞬态错误（如 SQLite database is locked）不得终止分发循环
+            logger.exception("worker_loop poll failed; continuing")
         time.sleep(2)
 ```
 
