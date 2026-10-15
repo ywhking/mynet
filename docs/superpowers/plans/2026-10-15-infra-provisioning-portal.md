@@ -1086,8 +1086,9 @@ class RealDeployer:
 
     def generate_inventory(self, script_path: str, cwd: str, env: dict[str, str]) -> str:
         import os
-        # bash 按子进程 cwd 解析脚本路径，故相对路径须先与 cwd 拼接
-        path = script_path if os.path.isabs(script_path) else os.path.join(cwd, script_path)
+        # bash 按子进程 cwd 解析脚本路径；若 cwd 本身是相对路径，仅 join 仍是相对的
+        # 会被二次解析，故必须 abspath 锚定到本进程 cwd（与 subprocess 的 cwd 基准一致）
+        path = os.path.abspath(os.path.join(cwd, script_path))
         return self._run(["bash", path, "--write"], cwd, env)
 
     def run_ansible(
