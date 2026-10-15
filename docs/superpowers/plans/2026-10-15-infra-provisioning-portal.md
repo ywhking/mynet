@@ -1425,6 +1425,7 @@ Expected: FAIL（路由不存在）
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
+from ..config import get_settings
 from ..db import get_db
 from ..models import Deployment, Run, User
 from ..quotas import validate_config
@@ -1449,7 +1450,11 @@ def create_deployment(body: DeploymentConfig, user: User = Depends(get_current_u
         .filter(Deployment.tenant_id == user.tenant_id, Run.status.in_(["pending", "running"]))
         .count()
     )
-    quota = {"max_vms": 10, "max_running": 1}
+    settings = get_settings()
+    quota = {
+        "max_vms": settings.quota_max_vms,
+        "max_running": settings.quota_max_running_deployments,
+    }
     errors = validate_config(body, quota, running)
     if errors:
         raise HTTPException(status_code=400, detail="; ".join(errors))
