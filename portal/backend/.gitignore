@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.db
+*.sqlite3
+
+# Virtualenv
+.venv/
+venv/
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Env
+.env
