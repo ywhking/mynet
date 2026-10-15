@@ -509,14 +509,14 @@ def test_register_creates_tenant_and_returns_token(client):
     r = client.post("/api/auth/register", json={
         "tenant_name": "Acme Corp",
         "email": "admin@acme.com",
-        "password": "s3cret",
+        "password": "s3cret123",
     })
     assert r.status_code == 200
     assert "access_token" in r.json()
 
 
 def test_register_duplicate_email_conflict(client):
-    body = {"tenant_name": "Acme", "email": "dup@acme.com", "password": "s3cret"}
+    body = {"tenant_name": "Acme", "email": "dup@acme.com", "password": "s3cret123"}
     assert client.post("/api/auth/register", json=body).status_code == 200
     r = client.post("/api/auth/register", json=body)
     assert r.status_code == 409
@@ -524,9 +524,9 @@ def test_register_duplicate_email_conflict(client):
 
 def test_login_roundtrip(client):
     client.post("/api/auth/register", json={
-        "tenant_name": "Acme", "email": "login@acme.com", "password": "s3cret",
+        "tenant_name": "Acme", "email": "login@acme.com", "password": "s3cret123",
     })
-    r = client.post("/api/auth/login", json={"email": "login@acme.com", "password": "s3cret"})
+    r = client.post("/api/auth/login", json={"email": "login@acme.com", "password": "s3cret123"})
     assert r.status_code == 200
     assert "access_token" in r.json()
 
@@ -1331,7 +1331,7 @@ git commit -m "feat(portal): run orchestration, state machine, and worker loop"
 `portal/backend/tests/test_deployments_api.py`:
 ```python
 def _register(client, email, tenant="Acme"):
-    r = client.post("/api/auth/register", json={"tenant_name": tenant, "email": email, "password": "s3cret"})
+    r = client.post("/api/auth/register", json={"tenant_name": tenant, "email": email, "password": "s3cret123"})
     return r.json()["access_token"]
 
 
@@ -1927,7 +1927,7 @@ test("register and see empty deployment list", async ({ page }) => {
   await page.goto("/register");
   await page.getByPlaceholder("组织/租户名").fill("Acme");
   await page.getByPlaceholder("邮箱").fill(`u${Date.now()}@acme.com`);
-  await page.getByPlaceholder("密码").fill("s3cret");
+  await page.getByPlaceholder("密码").fill("s3cret123");
   await page.getByRole("button", { name: "注册" }).click();
   await expect(page.getByText("部署")).toBeVisible();
 });
