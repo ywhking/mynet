@@ -96,3 +96,14 @@ def test_run_ansible_without_extra_args(tmp_path):
     out = d.run_ansible("setup-docker.yml", "/tmp", {})
     assert out.strip() == "setup-docker.yml"
     assert "-e" not in out
+
+
+def test_timeout_raises_deployer_error_with_partial_output(tmp_path):
+    fake = tmp_path / "terraform"
+    _write_exec(str(fake), "#!/bin/sh\necho partial-output\nexec sleep 30\n")
+    d = RealDeployer(terraform_bin=str(fake), ansible_bin="/bin/echo", timeout=1)
+    with pytest.raises(DeployerError) as ei:
+        d.terraform_apply("acme", "/tmp/x.tfvars", str(tmp_path), {})
+    assert "timed out" in str(ei.value)
+    assert isinstance(ei.value.output, str)
+    assert "partial-output" in ei.value.output
