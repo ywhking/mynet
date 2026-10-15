@@ -13,7 +13,10 @@ class DeployerError(Exception):
 class Deployer(Protocol):
     def terraform_apply(self, workspace: str, var_file: str, cwd: str, env: dict[str, str]) -> str: ...
     def terraform_destroy(self, workspace: str, var_file: str, cwd: str, env: dict[str, str]) -> str: ...
-    def run_ansible(self, playbook: str, cwd: str, env: dict[str, str]) -> str: ...
+    def generate_inventory(self, script_path: str, cwd: str, env: dict[str, str]) -> str: ...
+    def run_ansible(
+        self, playbook: str, cwd: str, env: dict[str, str], extra_args: list[str] | None = None
+    ) -> str: ...
 
 
 class RealDeployer:
@@ -63,5 +66,10 @@ class RealDeployer:
             cwd, env,
         )
 
-    def run_ansible(self, playbook: str, cwd: str, env: dict[str, str]) -> str:
-        return self._run([self.ansible_bin, playbook], cwd, env)
+    def generate_inventory(self, script_path: str, cwd: str, env: dict[str, str]) -> str:
+        return self._run(["bash", script_path, "--write"], cwd, env)
+
+    def run_ansible(
+        self, playbook: str, cwd: str, env: dict[str, str], extra_args: list[str] | None = None
+    ) -> str:
+        return self._run([self.ansible_bin, playbook, *(extra_args or [])], cwd, env)

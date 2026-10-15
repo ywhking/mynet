@@ -64,3 +64,35 @@ def test_terraform_destroy_includes_init(tmp_path):
     recorded = cmdfile.read_text().splitlines()
     assert recorded[0].startswith("init")
     assert any(line.startswith("destroy") for line in recorded)
+
+
+def test_generate_inventory_runs_script_with_write(tmp_path):
+    outfile = tmp_path / "out.txt"
+    script = tmp_path / "generate_inventory.sh"
+    script.write_text(f'#!/bin/sh\necho "$@" > "{outfile}"\n')
+    d = RealDeployer()
+    d.generate_inventory(str(script), "/tmp", {})
+    assert outfile.read_text().strip() == "--write"
+
+
+def test_run_ansible_passes_extra_args(tmp_path):
+    fake = tmp_path / "ansible-playbook"
+    _write_exec(str(fake), '#!/bin/sh\necho "$@"\nexit 0\n')
+    d = RealDeployer(terraform_bin="/bin/echo", ansible_bin=str(fake))
+    out = d.run_ansible(
+        "setup-netbird.yml",
+        "/tmp",
+        {},
+        extra_args=["-e", "netbird_letsencrypt_email=a@b.com"],
+    )
+    assert "-e" in out
+    assert "netbird_letsencrypt_email=a@b.com" in out
+
+
+def test_run_ansible_without_extra_args(tmp_path):
+    fake = tmp_path / "ansible-playbook"
+    _write_exec(str(fake), '#!/bin/sh\necho "$@"\nexit 0\n')
+    d = RealDeployer(terraform_bin="/bin/echo", ansible_bin=str(fake))
+    out = d.run_ansible("setup-docker.yml", "/tmp", {})
+    assert out.strip() == "setup-docker.yml"
+    assert "-e" not in out
