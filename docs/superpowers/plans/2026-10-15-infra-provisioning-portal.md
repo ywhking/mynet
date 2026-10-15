@@ -1043,19 +1043,19 @@ class RealDeployer:
 
     def terraform_apply(self, workspace: str, var_file: str, cwd: str, env: dict[str, str]) -> str:
         return self._run(
-            [self.terraform_bin, "workspace", "select", "-or-create", workspace, "-chdir", cwd],
+            [self.terraform_bin, "workspace", "select", "-or-create", workspace],
             cwd, env,
         ) + self._run(
-            [self.terraform_bin, "apply", "-auto-approve", f"-var-file={var_file}", "-chdir", cwd],
+            [self.terraform_bin, "apply", "-auto-approve", f"-var-file={var_file}"],
             cwd, env,
         )
 
     def terraform_destroy(self, workspace: str, var_file: str, cwd: str, env: dict[str, str]) -> str:
         return self._run(
-            [self.terraform_bin, "workspace", "select", "-or-create", workspace, "-chdir", cwd],
+            [self.terraform_bin, "workspace", "select", "-or-create", workspace],
             cwd, env,
         ) + self._run(
-            [self.terraform_bin, "destroy", "-auto-approve", f"-var-file={var_file}", "-chdir", cwd],
+            [self.terraform_bin, "destroy", "-auto-approve", f"-var-file={var_file}"],
             cwd, env,
         )
 
