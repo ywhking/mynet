@@ -59,8 +59,9 @@ class FakeDeployer:
         assert cwd == self.workdirs[-1], (cwd, self.workdirs)
         return "destroyed"
 
-    def generate_inventory(self, script_path, cwd, env):
+    def generate_inventory(self, script_path, cwd, env, terraform_dir=None):
         self.calls.append("inventory")
+        self.inventory_terraform_dir = terraform_dir
         return "inventory written"
 
     def run_ansible(self, playbook, cwd, env, extra_args=None):
@@ -186,6 +187,10 @@ def test_execute_create_marks_succeeded(db_factory):
     inventory_index = fake.calls.index("inventory")
     first_playbook_index = min(i for i, c in enumerate(fake.calls) if c in PLAYBOOKS)
     assert inventory_index < first_playbook_index, fake.calls
+
+    # inventory 必须针对本租户的工作目录生成：脚本默认按自身位置推导 terraform
+    # 目录（共享的 terraform/），不传就会读到平台自己的 state 与私钥。
+    assert fake.inventory_terraform_dir == fake.workdirs[-1]
 
     # netbird 的 extra vars 只挂在 setup-netbird.yml 上（不是 setup-netbird-agent.yml）。
     # email 取自 Settings（测试 env 里设置的真实地址），不是硬编码的 example.com

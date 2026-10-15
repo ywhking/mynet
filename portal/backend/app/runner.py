@@ -315,8 +315,12 @@ def execute_run(run_id: int, deployer: Deployer, session_factory) -> None:
             _append_log(run, out, log_parts, db, run_id)
 
             # spec §8 步骤 4：刷新静态 inventory，否则 ansible 会打到过期/不存在的 hosts.yml
+            # 必须指向本租户的工作目录：inventory 脚本默认按自身位置推导 terraform
+            # 目录（共享的 terraform/），那会读到平台自己的 state 与私钥。
             _append_log(run, "==> generate_inventory.sh --write", log_parts, db, run_id)
-            out = deployer.generate_inventory(settings.inventory_script, settings.ansible_dir, env)
+            out = deployer.generate_inventory(
+                settings.inventory_script, settings.ansible_dir, env, terraform_dir=workdir
+            )
             _append_log(run, out, log_parts, db, run_id)
 
             for playbook in PLAYBOOKS:

@@ -17,7 +17,9 @@ class Deployer(Protocol):
     def prepare_workdir(self, source_dir: str, tenants_dir: str, slug: str) -> str: ...
     def terraform_apply(self, var_file: str, cwd: str, env: dict[str, str]) -> str: ...
     def terraform_destroy(self, var_file: str, cwd: str, env: dict[str, str]) -> str: ...
-    def generate_inventory(self, script_path: str, cwd: str, env: dict[str, str]) -> str: ...
+    def generate_inventory(
+        self, script_path: str, cwd: str, env: dict[str, str], terraform_dir: str | None = None
+    ) -> str: ...
     def run_ansible(
         self, playbook: str, cwd: str, env: dict[str, str], extra_args: list[str] | None = None
     ) -> str: ...
@@ -132,7 +134,13 @@ class RealDeployer:
             cwd, env,
         )
 
-    def generate_inventory(self, script_path: str, cwd: str, env: dict[str, str]) -> str:
+    def generate_inventory(
+        self,
+        script_path: str,
+        cwd: str,
+        env: dict[str, str],
+        terraform_dir: str | None = None,
+    ) -> str:
         # bash resolves a relative script argument against the *child's* cwd, which
         # subprocess sets to `cwd`. Passing a cwd-relative script_path straight through
         # would therefore have it re-resolved against `cwd` a second time
@@ -143,7 +151,14 @@ class RealDeployer:
         import os
 
         path = script_path if os.path.isabs(script_path) else os.path.abspath(os.path.join(cwd, script_path))
-        return self._run(["bash", path, "--write"], cwd, env)
+        cmd = ["bash", path, "--write"]
+        if terraform_dir:
+            # The script otherwise derives its terraform directory from its own
+            # location (always the shared `terraform/`), so a tenant run would read
+            # the platform's state and private keys instead of its own. The flag
+            # must be absolute for the same child-cwd reason as `path` above.
+            cmd += ["--terraform-dir", os.path.abspath(terraform_dir)]
+        return self._run(cmd, cwd, env)
 
     def run_ansible(
         self, playbook: str, cwd: str, env: dict[str, str], extra_args: list[str] | None = None

@@ -1,6 +1,10 @@
+import json
 import os
+import shutil
 import stat
+import subprocess
 import tempfile
+from pathlib import Path
 
 import pytest
 
@@ -78,6 +82,36 @@ def test_generate_inventory_runs_script_with_write(tmp_path):
     d = RealDeployer()
     d.generate_inventory(str(script), "/tmp", {})
     assert outfile.read_text().strip() == "--write"
+
+
+def test_generate_inventory_passes_terraform_dir_as_absolute(tmp_path, monkeypatch):
+    """The inventory script derives its terraform dir from its own location, which is
+    always the shared `terraform/`. A tenant run must override it with the tenant's own
+    working directory, and the value has to be absolute for the same child-cwd reason
+    as the script path (bash resolves it against the child's cwd)."""
+    outfile = tmp_path / "out.txt"
+    script = tmp_path / "generate_inventory.sh"
+    script.write_text(f'#!/bin/sh\necho "$@" > "{outfile}"\n')
+    monkeypatch.chdir(tmp_path)  # a relative terraform_dir would resolve wrongly
+
+    d = RealDeployer()
+    d.generate_inventory(str(script), "/tmp", {}, terraform_dir="relative/tenant-dir")
+
+    recorded = outfile.read_text().strip()
+    assert recorded == f"--write --terraform-dir {tmp_path / 'relative/tenant-dir'}", recorded
+
+
+def test_generate_inventory_omits_terraform_dir_when_not_given(tmp_path):
+    """Default behaviour is unchanged — deploy-all.sh relies on the script's own
+    location-derived terraform directory."""
+    outfile = tmp_path / "out.txt"
+    script = tmp_path / "generate_inventory.sh"
+    script.write_text(f'#!/bin/sh\necho "$@" > "{outfile}"\n')
+
+    d = RealDeployer()
+    d.generate_inventory(str(script), "/tmp", {})
+
+    assert "--terraform-dir" not in outfile.read_text()
 
 
 def test_generate_inventory_resolves_relative_script_independently_of_cwd(tmp_path, monkeypatch):
@@ -232,3 +266,61 @@ def test_prepare_workdir_leaves_newer_copy_alone(tmp_path):
     d.prepare_workdir(str(src), str(tmp_path / "tenants"), "acme")
     assert marker.read_text() == "keep me"
     assert (workdir / "main.tf").stat().st_mtime == stamp
+
+
+def _make_fake_terraform_dir(root: Path, name: str, ip_suffix: int) -> Path:
+    """A minimal terraform dir: a state with resources plus a fake `terraform` binary."""
+    d = root / name
+    d.mkdir()
+    (d / "terraform.tfstate").write_text('{"resources":[{}]}')
+    inst = f"bastion-{name}"
+    output = {
+        "bastion_name": {"value": inst},
+        "bastion_public_ip": {"value": f"1.2.3.{ip_suffix}"},
+        "bastion_private_ip": {"value": "172.16.0.2"},
+        "vpc_cidr": {"value": "172.16.0.0/16"},
+        "ecs_private_ips": {"value": {inst: "172.16.0.2"}},
+        "ecs_public_ips": {"value": {inst: f"1.2.3.{ip_suffix}"}},
+        "dns_records": {"value": {inst: f"bastion.{name}.example.com"}},
+    }
+    fake = d / "terraform"
+    fake.write_text(
+        "#!/bin/sh\n"
+        '[ "$1" = "output" ] && cat <<\'JSON\'\n'
+        f"{json.dumps(output)}\n"
+        "JSON\n"
+    )
+    fake.chmod(fake.stat().st_mode | stat.S_IEXEC)
+    return d
+
+
+def test_real_inventory_script_reads_the_terraform_dir_it_is_given(tmp_path):
+    """End-to-end regression test for the multi-tenant bug.
+
+    `generate_inventory.sh` derives its terraform directory from its OWN location, so
+    it always pointed at the shared `terraform/`. A tenant run therefore read the
+    platform's state and `terraform/keys/` — producing a wrong inventory (or failing
+    outright with "未找到堡垒机"). Passing `--terraform-dir <tenant workdir>` is the
+    fix; this test asserts two different directories yield their own hosts and keys.
+    """
+    if shutil.which("jq") is None:
+        pytest.skip("jq is required to exercise the inventory script")
+
+    script = Path(__file__).resolve().parents[3] / "terraform/ansible/inventory/generate_inventory.sh"
+    assert script.is_file(), script
+
+    for name, suffix in (("alpha", 10), ("beta", 20)):
+        tf_dir = _make_fake_terraform_dir(tmp_path, name, suffix)
+        out_yml = tmp_path / f"{name}.yml"
+        env = {**os.environ, "PATH": f"{tf_dir}{os.pathsep}{os.environ['PATH']}"}
+
+        proc = subprocess.run(
+            ["bash", str(script), "--write", str(out_yml), "--terraform-dir", str(tf_dir)],
+            capture_output=True, text=True, env=env, cwd=str(tmp_path),
+        )
+        assert proc.returncode == 0, proc.stderr
+
+        written = out_yml.read_text()
+        assert f"bastion-{name}" in written          # 读的是本目录的 state
+        assert f"{tf_dir}/keys" in written           # 私钥也来自本目录
+        assert f"bastion.{name}.example.com" in written

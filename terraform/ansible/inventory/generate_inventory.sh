@@ -12,12 +12,42 @@
 #   ./generate_inventory.sh --list          # 输出完整 inventory
 #   ./generate_inventory.sh --host <name>   # 输出单台主机变量（可选）
 #   ./generate_inventory.sh --write [路径]  # 固化为静态 inventory（hosts.yml）
+#
+# 可选:
+#   --terraform-dir <路径>   指定 terraform 目录（读取其中的 state 与 keys/）。
+#                            默认按脚本位置推导。多租户/多工作目录时必须显式指定，
+#                            否则会读到别的目录的 state 与私钥。也可用 TF_DIR 环境变量。
 # ============================================================
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-TERRAFORM_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+# Terraform 目录：默认为脚本所在仓库的 terraform/（既有用法不变）。
+# 多租户场景下每个租户有各自的工作目录（state 与 keys 都在其中），
+# 需用 --terraform-dir <path> 或 TF_DIR 指向该目录。
+TERRAFORM_DIR="${TF_DIR:-$(cd "$SCRIPT_DIR/../.." && pwd)}"
+
+# 先摘出 --terraform-dir，其余参数原样留给下面的子命令解析
+ARGS=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --terraform-dir)
+            [[ $# -ge 2 ]] || { echo "ERROR: --terraform-dir 需要一个路径参数" >&2; exit 2; }
+            TERRAFORM_DIR="$2"; shift 2 ;;
+        --terraform-dir=*)
+            TERRAFORM_DIR="${1#*=}"; shift ;;
+        *)
+            ARGS+=("$1"); shift ;;
+    esac
+done
+set -- ${ARGS[@]+"${ARGS[@]}"}
+
+if [[ ! -d "$TERRAFORM_DIR" ]]; then
+    echo "ERROR: terraform 目录不存在: $TERRAFORM_DIR" >&2
+    exit 2
+fi
+TERRAFORM_DIR="$(cd "$TERRAFORM_DIR" && pwd)"
 KEY_DIR="$TERRAFORM_DIR/keys"
 
 # 检查 jq 是否可用
@@ -91,6 +121,10 @@ generate_inventory() {
     all_instances=$(echo "$tf_output" | jq -r '.ecs_private_ips.value | keys[]')
     public_ip_map=$(echo "$tf_output" | jq -c '.ecs_public_ips.value // {}')
 
+    # 堡垒机域名（dns_records 输出: 实例名 → 完整域名，如 bastion.ohmynet.vip）
+    local bastion_domain
+    bastion_domain=$(echo "$tf_output" | jq -r --arg n "$bastion_name" '.dns_records.value[$n] // ""')
+
     # 分组: nat_gateway（堡垒机）/ public（公网设备）/ internal（内网设备）
     local public_hosts=() internal_hosts=()
     while IFS= read -r instance_name; do
@@ -114,7 +148,12 @@ generate_inventory() {
     hostvars_json+="\"ansible_ssh_private_key_file\":\"$bastion_key\","
     hostvars_json+="\"ansible_ssh_common_args\":\"-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null\","
     hostvars_json+="\"vpc_cidr\":\"$vpc_cidr\","
-    hostvars_json+="\"bastion_private_ip\":\"$bastion_private_ip\""
+    hostvars_json+="\"bastion_private_ip\":\"$bastion_private_ip\","
+    hostvars_json+="\"netbird_domain\":\"$bastion_domain\""
+    if [[ -n "$bastion_domain" ]]; then
+        # NetBird 管理服务器地址（供 setup-netbird-agent.yml 推导，无域名时不生成）
+        hostvars_json+=",\"netbird_management_url\":\"https://$bastion_domain\""
+    fi
     hostvars_json+="}"
 
     # 其余 ECS hostvars: 有独立公网 IP 直连；否则通过堡垒机 ProxyJump 访问
@@ -146,6 +185,10 @@ generate_inventory() {
         fi
         hostvars_json+="\"gateway_ip\":\"$bastion_private_ip\","
         hostvars_json+="\"vpc_cidr\":\"$vpc_cidr\""
+        if [[ -n "$bastion_domain" ]]; then
+            # NetBird 管理服务器地址（供 setup-netbird-agent.yml 推导，无域名时不生成）
+            hostvars_json+=",\"netbird_management_url\":\"https://$bastion_domain\""
+        fi
         hostvars_json+="}"
     done <<< "$all_instances"
 
@@ -241,7 +284,7 @@ case "${1:-}" in
         write_static_inventory "${2:-}"
         ;;
     *)
-        echo "Usage: $0 --list | --host <hostname> | --write [输出路径]" >&2
+        echo "Usage: $0 [--terraform-dir <路径>] --list | --host <hostname> | --write [输出路径]" >&2
         exit 1
         ;;
 esac
