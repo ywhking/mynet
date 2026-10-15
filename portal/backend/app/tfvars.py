@@ -1,9 +1,14 @@
+import json
+
 from .config import Settings
 from .schemas import DeploymentConfig
 
 
 def _quote(s: str) -> str:
-    return f'"{s}"'
+    # json.dumps produces a double-quoted string with `"`, `\`, control chars
+    # and non-ASCII escaped using only sequences HCL also understands, so the
+    # result is a valid HCL string literal and cannot break out of the quotes.
+    return json.dumps(s)
 
 
 def generate_tfvars(config: DeploymentConfig, tenant_slug: str, settings: Settings) -> str:

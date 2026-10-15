@@ -30,3 +30,48 @@ def test_generate_tfvars_contains_expected_values():
 def test_generate_tfvars_quotes_values():
     out = generate_tfvars(_config(), "acme", get_settings())
     assert '"172.16.0.0/24"' in out
+
+
+def test_generate_tfvars_escapes_quotes_in_instance_values():
+    config = DeploymentConfig(
+        subdomain="acme",
+        public_devices={
+            "cidr": "172.16.0.0/24",
+            "instances": {
+                "bastion": {
+                    "host_name": 'evil"name',
+                    "public_ip": True,
+                    "is_bastion": True,
+                    "domain_name": 'evil"domain',
+                },
+            },
+        },
+        internal_devices={"cidr": "172.16.1.0/24", "instances": {"db": {"host_name": "db"}}},
+    )
+    out = generate_tfvars(config, "acme", get_settings())
+    # Quotes must be escaped inside the HCL string literal, not emitted raw.
+    assert 'evil\\"name' in out
+    assert 'evil\\"domain' in out
+    assert 'evil"name' not in out
+    assert 'evil"domain' not in out
+
+
+def test_generate_tfvars_escapes_backslash_and_newline():
+    config = DeploymentConfig(
+        subdomain="acme",
+        public_devices={
+            "cidr": "172.16.0.0/24",
+            "instances": {
+                "bastion": {
+                    "host_name": "back\\slash",
+                    "public_ip": True,
+                    "is_bastion": True,
+                    "domain_name": "line\nbreak",
+                },
+            },
+        },
+        internal_devices={"cidr": "172.16.1.0/24", "instances": {"db": {"host_name": "db"}}},
+    )
+    out = generate_tfvars(config, "acme", get_settings())
+    assert "back\\\\slash" in out
+    assert "line\\nbreak" in out
