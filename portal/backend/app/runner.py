@@ -73,6 +73,19 @@ def _env_for(settings) -> dict[str, str]:
     }
 
 
+def _deployment_terminal_status(run_type: str, status: str) -> str:
+    """The parent ``Deployment.status`` for a terminal run.
+
+    ``destroy`` success must NOT reuse ``"succeeded"``: that value means "live
+    infrastructure exists" (it is exactly what the destroy endpoint's admission
+    check requires), so a destroyed deployment marked ``"succeeded"`` would both
+    render as a healthy deployment in the UI and re-admit a second destroy.
+    """
+    if status == "succeeded" and run_type == "destroy":
+        return "destroyed"
+    return status
+
+
 def _finalize_run(
     run: Run,
     run_id: int,
@@ -81,8 +94,9 @@ def _finalize_run(
     log_parts: list[str],
     db,
     message: str | None = None,
+    deployment: Deployment | None = None,
 ) -> None:
-    """Write the terminal state (and the full log) onto the run.
+    """Write the terminal state (and the full log) onto the run and its deployment.
 
     The commit is retried once on failure: a rollback expires the run's ORM
     attributes, so a retry must re-assign them or the run would be left sitting in a
@@ -97,6 +111,10 @@ def _finalize_run(
         run.error = error
         run.log = _render_log(log_parts)
         run.finished_at = utcnow()
+        # Re-assigned inside the loop: a rollback expires the attributes, and the
+        # retry below must not lose the deployment's transition.
+        if deployment is not None:
+            deployment.status = _deployment_terminal_status(run.type, status)
         try:
             db.commit()
             return
@@ -136,9 +154,15 @@ def execute_run(run_id: int, deployer: Deployer, session_factory) -> None:
         logger.warning("run %s not found; nothing to do", run_id)
         db.close()
         return
+    # 父 Deployment 的状态必须跟着 run 走：列表接口只读它，若不同步，部署永远停在
+    # "draft"，前端既看不出是活的也看不出是失败的。
+    deployment: Deployment | None = None
     run.status = "running"
     run.started_at = utcnow()
     try:
+        deployment = run.deployment
+        if deployment is not None:
+            deployment.status = "running"
         db.commit()
     except Exception:  # noqa: BLE001
         # 状态未落盘，run 仍是 pending，worker 会重新领走
@@ -150,6 +174,8 @@ def execute_run(run_id: int, deployer: Deployer, session_factory) -> None:
         # Everything below is inside the try: a missing deployment/tenant row or a
         # lazy-load failure must land the run in a terminal state too, otherwise it
         # stays "running" forever and worker_loop (pending-only) never retries it.
+        # Re-resolved here: the "running" commit above expires the attributes, and a
+        # rollback there would leave the earlier reference unusable.
         deployment = run.deployment
         if deployment is None:
             raise RuntimeError(f"deployment for run {run_id} is missing")
@@ -187,15 +213,29 @@ def execute_run(run_id: int, deployer: Deployer, session_factory) -> None:
                 out = deployer.run_ansible(playbook, settings.ansible_dir, env, extra)
                 _append_log(run, out, log_parts, db, run_id)
 
-        _finalize_run(run, run_id, "succeeded", None, log_parts, db)
+        _finalize_run(run, run_id, "succeeded", None, log_parts, db, deployment=deployment)
     except DeployerError as e:
         _finalize_run(
-            run, run_id, "failed", str(e), log_parts, db, message=f"ERROR: {e}\n{e.output}"
+            run,
+            run_id,
+            "failed",
+            str(e),
+            log_parts,
+            db,
+            message=f"ERROR: {e}\n{e.output}",
+            deployment=deployment,
         )
     except Exception as e:  # noqa: BLE001
         logger.exception("run %s failed unexpectedly", run_id)
         _finalize_run(
-            run, run_id, "failed", str(e), log_parts, db, message=f"UNEXPECTED ERROR: {e}"
+            run,
+            run_id,
+            "failed",
+            str(e),
+            log_parts,
+            db,
+            message=f"UNEXPECTED ERROR: {e}",
+            deployment=deployment,
         )
     finally:
         _finish_run(run, run_id, db)

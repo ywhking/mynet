@@ -35,13 +35,14 @@ def create_deployment(body: DeploymentConfig, user: User = Depends(get_current_u
     if errors:
         raise HTTPException(status_code=400, detail="; ".join(errors))
 
+    # One transaction for both rows: a second commit that fails would leave a
+    # Deployment with no Run — never executed, and (since nothing else sets the
+    # status) permanently invisible at "draft". `Run(deployment=dep)` instead of
+    # `deployment_id=dep.id` so the FK resolves from the relationship in the same
+    # flush, with no prior commit needed to populate `dep.id`.
     dep = Deployment(tenant_id=user.tenant_id, config=body.model_dump(), status="draft")
-    db.add(dep)
-    db.commit()
-    db.refresh(dep)
-
-    run = Run(deployment_id=dep.id, type="create", status="pending")
-    db.add(run)
+    run = Run(deployment=dep, type="create", status="pending")
+    db.add_all([dep, run])
     db.commit()
     return {"id": dep.id, "run_id": run.id, "status": "pending"}
 
@@ -72,6 +73,26 @@ def get_deployment(dep_id: int, user: User = Depends(get_current_user), db: Sess
 @router.post("/{dep_id}/destroy")
 def destroy_deployment(dep_id: int, user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     dep = _owned_deployment(db, dep_id, user)
+
+    # 重复 POST 会堆积 destroy run，每个都对已销毁的 state 再跑一次 terraform destroy
+    active = (
+        db.query(Run)
+        .filter(Run.deployment_id == dep.id, Run.type == "destroy", Run.status.in_(["pending", "running"]))
+        .first()
+    )
+    if active is not None:
+        raise HTTPException(
+            status_code=400, detail=f"A destroy run is already {active.status} for this deployment"
+        )
+
+    # "succeeded" 是"存在成功创建的基础设施"的唯一标志（见 runner 的终态映射：
+    # destroy 成功会把它推进到 "destroyed"），所以 draft/failed/destroyed 都不该被销毁
+    if dep.status != "succeeded":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Nothing to destroy: deployment status is {dep.status!r}, expected 'succeeded'",
+        )
+
     run = Run(deployment_id=dep.id, type="destroy", status="pending")
     db.add(run)
     db.commit()

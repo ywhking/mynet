@@ -71,6 +71,59 @@ def _get_run(db_factory, run_id):
         db.close()
 
 
+def _deployment_id_for_run(db_factory, run_id):
+    db = db_factory()
+    try:
+        return db.query(Run).get(run_id).deployment_id
+    finally:
+        db.close()
+
+
+def _deployment_status(db_factory, run_id):
+    """Status of the Deployment that `run_id` belongs to.
+
+    Read as a plain value inside the session: a detached instance's expired
+    attributes would raise on access after `close()`.
+    """
+    db = db_factory()
+    try:
+        run = db.query(Run).get(run_id)
+        return db.query(Deployment).get(run.deployment_id).status
+    finally:
+        db.close()
+
+
+def _add_run(db_factory, deployment_id, run_type):
+    db = db_factory()
+    r = Run(deployment_id=deployment_id, type=run_type, status="pending")
+    db.add(r); db.commit()
+    run_id = r.id
+    db.close()
+    return run_id
+
+
+class _StatusProbeDeployer(FakeDeployer):
+    """Reads the parent Deployment's status from *inside* a run.
+
+    The only way to catch a missing "running" write: observing the row from a
+    separate session while `terraform_apply` is in flight.
+    """
+
+    def __init__(self, session_factory, dep_id):
+        super().__init__()
+        self._session_factory = session_factory
+        self._dep_id = dep_id
+        self.observed: list[str | None] = []
+
+    def terraform_apply(self, workspace, var_file, cwd, env):
+        db = self._session_factory()
+        try:
+            self.observed.append(db.query(Deployment).get(self._dep_id).status)
+        finally:
+            db.close()
+        return super().terraform_apply(workspace, var_file, cwd, env)
+
+
 def _extra_args_for(fake, playbook):
     """The extra args of a single ansible invocation (each playbook runs once)."""
     matches = [args for pb, args in fake.ansible_calls if pb == playbook]
@@ -211,6 +264,66 @@ def test_worker_loop_keeps_dispatching_after_a_run_finishes(db_factory):
         stop.set()
         worker.join(timeout=5.0)
         assert not worker.is_alive()
+
+
+def test_deployment_status_becomes_running_before_terraform(db_factory):
+    """部署状态必须跟着 run 进入 "running"，且在 terraform 真正开跑之前就已落库。
+
+    回归保护：若 runner 只写 run.status，父 Deployment 永远停在 "draft"，
+    GET /api/deployments 就无法渲染任何生命周期状态。
+    """
+    probe_run = _make_run(db_factory, FakeDeployer())
+    dep_id = _deployment_id_for_run(db_factory, probe_run)
+    assert _deployment_status(db_factory, probe_run) == "draft"
+
+    probe = _StatusProbeDeployer(db_factory, dep_id)
+    execute_run(probe_run, probe, db_factory)
+    assert probe.observed == ["running"], probe.observed
+
+
+def test_deployment_status_succeeded_after_create(db_factory):
+    fake = FakeDeployer()
+    run_id = _make_run(db_factory, fake)
+    execute_run(run_id, fake, db_factory)
+    assert _get_run(db_factory, run_id).status == "succeeded"
+    assert _deployment_status(db_factory, run_id) == "succeeded"
+
+
+def test_deployment_status_failed_on_deployer_error(db_factory):
+    fake = FakeDeployer(fail_on="apply")
+    run_id = _make_run(db_factory, fake)
+    execute_run(run_id, fake, db_factory)
+    assert _get_run(db_factory, run_id).status == "failed"
+    assert _deployment_status(db_factory, run_id) == "failed"
+
+
+def test_deployment_status_failed_on_unexpected_error(db_factory):
+    """非 DeployerError 路径同样要把父部署推进到 failed（两条失败路径都要覆盖）。"""
+    fake = FakeDeployer(raise_on="apply")
+    run_id = _make_run(db_factory, fake)
+    execute_run(run_id, fake, db_factory)
+    assert _get_run(db_factory, run_id).status == "failed"
+    assert _deployment_status(db_factory, run_id) == "failed"
+
+
+def test_deployment_status_destroyed_after_destroy(db_factory):
+    """destroy 成功后部署必须落到 "destroyed"。
+
+    若沿用 "succeeded"，破坏掉的部署看起来仍是"有活的基础设施"的成功部署：
+    前端会显示成部署成功，且 destroy 的准入校验（要求 status == "succeeded"）
+    会放行第二次销毁。
+    """
+    fake = FakeDeployer()
+    create_run = _make_run(db_factory, fake)
+    execute_run(create_run, fake, db_factory)
+    assert _deployment_status(db_factory, create_run) == "succeeded"
+
+    dep_id = _deployment_id_for_run(db_factory, create_run)
+    destroy_run = _add_run(db_factory, dep_id, "destroy")
+    execute_run(destroy_run, fake, db_factory)
+
+    assert _get_run(db_factory, destroy_run).status == "succeeded"
+    assert _deployment_status(db_factory, destroy_run) == "destroyed"
 
 
 def test_worker_loop_survives_a_broken_session_factory():
