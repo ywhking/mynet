@@ -1,0 +1,290 @@
+# ============================================================
+# Ansible Playbook: 基于自建二进制安装 NetBird 客户端（agent）
+# ============================================================
+#
+# 说明: 不走官方仓库（pkgs.netbird.io / GitHub Releases）——将本地
+#   自构建的 netbird 二进制和安装脚本（scripts/install_netbird_bin.sh）
+#   预先上传到目标 ECS，再在目标机上静默执行安装。
+#   仅安装 CLI（netbird），不安装 netbird-ui（无桌面环境）。
+#   安装完成后自动通过 setup key 注册 peer：
+#     每台 ECS 独立调用 scripts/get_setup_key.sh（在堡垒机上执行）获取
+#     setup key（名称 = 该 ECS 主机名），再执行 netbird up 注册连接。
+#   网络路径修复: 自动在目标机 /etc/hosts 将管理域名指向堡垒机私网 IP —— 管理域名解析到
+#     堡垒机公网 IP，内网机经 NAT 访问会陷入 hairpin 环路（netbird up 注册挂死）；
+#     走 VPC local 路由直达私网 IP 则无此问题。堡垒机自身跳过。
+#
+# 使用方法:
+#   # 默认: 内网设备（internal 组）
+#   ansible-playbook playbooks/setup-netbird-agent.yml
+#
+#   # 指定主机 / 公网设备组
+#   ansible-playbook playbooks/setup-netbird-agent.yml -l web-server
+#   ansible-playbook playbooks/setup-netbird-agent.yml -e netbird_agent_target=public
+#
+#   # 指定二进制路径 / 管理服务器地址（默认从堡垒机域名自动推导）
+#   ansible-playbook playbooks/setup-netbird-agent.yml \
+#     -e netbird_binary=/path/to/netbird \
+#     -e netbird_management_url=https://bastion.ohmynet.vip
+#
+#   # 覆盖 get_setup_key.sh 的登录账号（留空则用脚本内置默认值）
+#   ansible-playbook playbooks/setup-netbird-agent.yml \
+#     -e netbird_setup_email=admin@ohmynet.vip -e netbird_setup_password=xxx
+#
+# 前置条件:
+#   - terraform apply + ./inventory/generate_inventory.sh --write
+#   - NetBird 服务端已部署（playbooks/setup-netbird.yml）
+#   - 安全组已放行管理服务器 443/tcp + 3478/udp（vpc.tf 中 allow_stun 规则）
+#   - 堡垒机（nat_gateway 组）已安装 curl + python3（get_setup_key.sh 依赖）
+#
+# 更新客户端: 替换本地二进制后重跑本 playbook 即可（已注册 peer 会跳过注册步骤）。
+# ============================================================
+
+- name: Install NetBird agent (self-built binary) + setup key registration
+  hosts: "{{ netbird_agent_target | default('internal', true) }}"
+  gather_facts: yes
+  tags: [netbird-agent]
+
+  vars:
+    # 本地自构建二进制（netbirdio/netbird 源码构建产物，如 go build -o netbird ./client），
+    # 可用 -e netbird_binary=... 覆盖
+    netbird_binary: /home/ywhking/develop/netbird/netbird
+    # 管理服务器地址（优先级）:
+    #   -e netbird_management_url > inventory hostvar netbird_management_url
+    #   （generate_inventory.sh 自动生成，即 https://堡垒机域名）
+    #
+    # ---- setup key 获取（每台 ECS 独立一个，名称 = 该 ECS 主机名）----
+    # 注意: get_setup_key.sh 必须在云端堡垒机（nat_gateway 组）上执行，而非控制机——
+    # 控制机（家庭网络）访问 *.ohmynet.vip:443 的 TLS 握手会被 GFW/ISP 按 SNI 重置
+    # （实测: 同 IP 换任何其他 SNI 均可正常握手），堡垒机在阿里云内网路径不受影响，
+    # 与 setup-netbird.yml 的 --no-key 登录验证走同一路径。
+    netbird_bastion: "{{ groups['nat_gateway'] | first }}"   # 堡垒机主机名（inventory nat_gateway 组）
+    netbird_setup_key_script: "{{ playbook_dir }}/../../scripts/get_setup_key.sh"
+    netbird_setup_key_days: 7        # setup key 有效天数（-e netbird_setup_key_days=... 覆盖）
+    netbird_setup_key_name: "{{ inventory_hostname }}"   # 名称与 ECS 名称保持一致
+    netbird_setup_email: ""          # 覆盖 get_setup_key.sh 内置 EMAIL（留空用脚本默认）
+    netbird_setup_password: ""       # 覆盖 get_setup_key.sh 内置 PASSWORD（留空用脚本默认）
+
+  tasks:
+    # --- 预检（只读，始终执行） ---
+    - name: 显示目标主机信息
+      ansible.builtin.debug:
+        msg:
+          - "主机: {{ inventory_hostname }} ({{ ansible_host }})"
+          - "本地二进制: {{ netbird_binary }}"
+
+    - name: 预检本地二进制存在
+      ansible.builtin.stat:
+        path: "{{ netbird_binary }}"
+      delegate_to: localhost
+      run_once: true
+      register: bin_stat
+
+    - name: 确认本地二进制存在
+      ansible.builtin.assert:
+        that:
+          - bin_stat.stat.exists
+          # 10MB 下限防传错文件（netbird CLI 二进制通常 60-90MB）
+          - bin_stat.stat.size > 10000000
+        fail_msg: >-
+          未找到自构建 netbird 二进制: {{ netbird_binary }}
+          请先构建: cd netbird 源码目录 && GOOS=linux GOARCH=amd64 make build，
+          或用 -e netbird_binary=/path/to/netbird 指定路径
+
+    # --- 确定管理服务器地址 ---
+    - name: 确定 NetBird 管理服务器地址
+      ansible.builtin.set_fact:
+        netbird_mgmt_url: "{{ netbird_management_url | default(hostvars[inventory_hostname].netbird_management_url | default('', true), true) }}"
+
+    - name: 校验管理服务器地址
+      ansible.builtin.assert:
+        that:
+          - netbird_mgmt_url != ''
+          - netbird_mgmt_url is match('^https://')
+        fail_msg: >-
+          无法确定管理服务器地址 — 请用 -e netbird_management_url=https://<域名> 显式指定，
+          或重跑 ./inventory/generate_inventory.sh --write 生成 hostvar
+          （当前值: '{{ netbird_mgmt_url }}'）
+
+    # --- 网络路径修复: 内网机经堡垒机私网 IP 访问管理服务器 ---
+    # 背景: 管理域名解析到堡垒机公网 IP，内网机默认路由（0.0.0.0/0 → 堡垒机 ENI）把
+    #       流量送到堡垒机 NAT 出去后，目的地却是堡垒机自己的公网 IP —— hairpin 环路，
+    #       SYN 无人应答，netbird up 注册 180s 挂死（实测三台内网机同症状）。
+    # 修复: /etc/hosts 将管理域名指向堡垒机私网 IP（VPC local 路由直达，不经 NAT）。
+    #       管理 URL 保持 https://<域名> 不变，TLS 证书校验不受影响；
+    #       堡垒机自身跳过（它就是服务端，经公网 IP 访问自己正常）。
+    - name: 提取管理域名
+      ansible.builtin.set_fact:
+        netbird_mgmt_domain: "{{ netbird_mgmt_url | regex_replace('^https://([^/:]+).*$', '\\1') }}"
+
+    - name: 内网机经堡垒机私网 IP 解析管理域名（规避 hairpin NAT 环路）
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        regexp: "{{ netbird_mgmt_domain }}$"
+        line: "{{ hostvars[netbird_bastion].bastion_private_ip }} {{ netbird_mgmt_domain }}"
+        state: present
+      when: inventory_hostname != netbird_bastion
+
+    # --- 上传二进制与安装脚本（copy 模块幂等: 内容一致时跳过） ---
+    - name: 上传 netbird 二进制到目标机
+      ansible.builtin.copy:
+        src: "{{ netbird_binary }}"
+        dest: /root/netbird
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: 上传安装脚本到目标机
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../../scripts/install_netbird_bin.sh"
+        dest: /root/install_netbird_bin.sh
+        owner: root
+        group: root
+        mode: "0755"
+
+    # --- 执行安装（受 --check 影响，dry-run 时跳过） ---
+    # 脚本幂等: 二进制一致且服务运行中时输出 SKIP_INSTALL 并跳过
+    - name: 执行 NetBird 客户端安装脚本
+      ansible.builtin.shell: bash /root/install_netbird_bin.sh
+      environment:
+        NETBIRD_MANAGEMENT_URL: "{{ netbird_mgmt_url }}"
+      register: agent_install
+      changed_when: "'SKIP_INSTALL' not in agent_install.stdout"
+      async: 300
+      poll: 10
+      when: not ansible_check_mode
+
+    - name: 安装输出
+      ansible.builtin.debug:
+        msg: "{{ agent_install.stdout_lines | default(['(skipped in check mode)']) }}"
+
+    # --- 验证（始终执行，只读） ---
+    - name: 验证 netbird 版本与服务状态
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -eu
+          netbird version
+          systemctl is-active netbird
+          systemctl is-enabled netbird
+      register: agent_verify
+      changed_when: false
+      check_mode: false
+
+    - name: 确认客户端已安装并运行
+      ansible.builtin.assert:
+        that:
+          # 自构建版本号无固定格式（如 development-e56eb14c5212-dirty），
+          # 只验证版本命令有输出 + 服务 active/enabled（共 3 行）
+          - agent_verify.stdout_lines | length == 3
+          - "'active' in agent_verify.stdout"
+          - "'enabled' in agent_verify.stdout"
+        success_msg: "✓ {{ inventory_hostname }} NetBird 客户端已安装并运行"
+        fail_msg: "✗ {{ inventory_hostname }} NetBird 客户端异常 — 检查: journalctl -u netbird -n 50"
+      when: not ansible_check_mode
+
+    # --- 获取 setup key（每台 ECS 独立，名称 = 主机名，在堡垒机上执行） ---
+    # get_setup_key.sh 走设备码 + 本地表单提交，全程无需浏览器；
+    # 账号默认取脚本内置值（可用 -e netbird_setup_email/-e netbird_setup_password 覆盖）。
+    # 必须在堡垒机上执行: 控制机（家庭网络）到管理域名的 TLS 握手被 GFW/ISP 按 SNI 重置
+    # （见上方 vars 注释），堡垒机在阿里云内网路径上可正常访问管理服务器。
+    - name: 上传 get_setup_key.sh 到堡垒机
+      ansible.builtin.copy:
+        src: "{{ netbird_setup_key_script }}"
+        dest: /root/get_setup_key.sh
+        owner: root
+        group: root
+        mode: "0755"
+      delegate_to: "{{ netbird_bastion }}"
+      run_once: true
+      when: not ansible_check_mode
+
+    - name: 获取 setup key（{{ netbird_mgmt_url }}，名称 = {{ inventory_hostname }}）
+      ansible.builtin.shell: >
+        bash /root/get_setup_key.sh
+        --name {{ netbird_setup_key_name }}
+        --days {{ netbird_setup_key_days }}
+      args:
+        executable: /bin/bash
+      environment:
+        MGMT_URL: "{{ netbird_mgmt_url }}"
+        EMAIL: "{{ netbird_setup_email }}"
+        PASSWORD: "{{ netbird_setup_password }}"
+      delegate_to: "{{ netbird_bastion }}"
+      register: setup_key_result
+      changed_when: "'Setup Key:' in setup_key_result.stdout"
+      when: not ansible_check_mode
+
+    - name: 提取 setup key
+      ansible.builtin.set_fact:
+        netbird_setup_key: "{{ (setup_key_result.stdout | regex_search('Setup Key: (\\S+)', '\\1')) | first }}"
+      when: not ansible_check_mode
+
+    - name: 校验 setup key 提取成功
+      ansible.builtin.assert:
+        that:
+          - netbird_setup_key | length > 10
+        fail_msg: >-
+          无法从 get_setup_key.sh 输出中提取 setup key（{{ netbird_mgmt_url }}）
+          — 请检查网络与账号（-e netbird_setup_email=... -e netbird_setup_password=...）
+      when: not ansible_check_mode
+
+    # --- 通过 setup key 注册 peer（netbird up） ---
+    - name: 检查 peer 是否已注册
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -eu
+          if netbird status --json 2>/dev/null | grep -q '"Connected"'; then
+            echo REGISTERED
+          else
+            echo NOT_REGISTERED
+          fi
+      register: nb_reg_status
+      changed_when: false
+      check_mode: false
+
+    - name: 通过 setup key 注册 peer（netbird up）
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -eu
+          timeout 180 netbird up --setup-key {{ netbird_setup_key }}
+      register: nb_up
+      changed_when: true
+      async: 200
+      poll: 10
+      when:
+        - not ansible_check_mode
+        - nb_reg_status.stdout == 'NOT_REGISTERED'
+
+    - name: 确认 peer 已连接
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -eu
+          netbird status --json
+      register: nb_conn
+      changed_when: false
+      check_mode: false
+
+    - name: 确认 peer 已连接
+      ansible.builtin.assert:
+        that:
+          - '"Connected" in nb_conn.stdout'
+        success_msg: "✓ {{ inventory_hostname }} 已通过 setup key 注册并连接 NetBird"
+        fail_msg: "✗ {{ inventory_hostname }} 注册/连接失败 — 检查: journalctl -u netbird -n 50"
+      when: not ansible_check_mode
+
+    - name: 部署汇总
+      ansible.builtin.debug:
+        msg:
+          - "=========================================="
+          - "  🎉 NetBird 客户端安装完成: {{ inventory_hostname }}"
+          - "=========================================="
+          - "管理服务器: {{ netbird_mgmt_url }}"
+          - "二进制: /usr/bin/netbird（自建，无 UI）"
+          - "注册方式: setup key（名称 {{ netbird_setup_key_name }}，已 netbird up 注册）"
+          - ""
+          - "更新客户端: 替换本地二进制后重跑本 playbook"
+          - "=========================================="
+      when: not ansible_check_mode

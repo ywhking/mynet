@@ -1,0 +1,323 @@
+# ============================================================
+# Ansible Playbook: 配置堡垒机 NAT 网关 + 验证内部 ECS 外网连通
+# ============================================================
+#
+# 使用方法:
+#   # 预览变更（检测类任务仍会执行，变更类任务跳过）
+#   ansible-playbook -i inventory/generate_inventory.sh playbooks/setup-all.yml --check
+#
+#   # 仅测试连通性（不执行任何变更）
+#   ansible all -i inventory/generate_inventory.sh -m ping
+#
+#   # 执行
+#   ansible-playbook -i inventory/generate_inventory.sh playbooks/setup-all.yml
+#
+#   # 仅 NAT 网关
+#   ansible-playbook -i inventory/generate_inventory.sh playbooks/setup-all.yml --tags nat
+#
+#   # 仅验证内部 ECS 外网连通
+#   ansible-playbook -i inventory/generate_inventory.sh playbooks/setup-all.yml --tags client
+#
+# 前置条件:
+#   - terraform apply 已执行完毕
+#   - 密钥对文件存在于 keys/ 目录下
+#   - 目标 ECS 已安装 python3（Ubuntu 24.04 默认已安装）
+# ============================================================
+
+# ============================================================
+# Play 1: 配置 NAT 网关（有公网 IP 的 ECS）
+# ============================================================
+- name: Configure NAT Gateway on bastion ECS
+  hosts: nat_gateway
+  gather_facts: yes
+  tags: [nat]
+
+  tasks:
+    # --- 预检：网络接口检测（始终执行，不受 --check 影响） ---
+    - name: 检测主网络接口
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -eu
+          IFACE=$(ip route show default 2>/dev/null | head -1 | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+          if [[ -z "$IFACE" ]]; then
+            IFACE=$(ip -o link show | grep -v 'lo:' | head -1 | awk -F': ' '{print $2}')
+          fi
+          echo "$IFACE"
+      register: wan_interface
+      changed_when: false
+      check_mode: false
+
+    - name: 显示检测到的网络接口
+      ansible.builtin.debug:
+        msg:
+          - "主网络接口: {{ wan_interface.stdout }}"
+          - "内网IP (NAT 网关地址): {{ bastion_private_ip }}"
+          - "VPC CIDR: {{ vpc_cidr }}"
+
+    # --- 上传脚本 ---
+    - name: 上传 install_nat_gateway.sh 到堡垒机
+      ansible.builtin.copy:
+        src: "{{ playbook_dir }}/../../scripts/install_nat_gateway.sh"
+        dest: /root/install_nat_gateway.sh
+        owner: root
+        group: root
+        mode: "0755"
+
+    # --- 预处理：允许单网卡 NAT（云 VPC 环境中 ECS 通常只有一个网卡） ---
+    # 原始脚本要求 WAN_IF != LAN_IF（物理机双网卡场景），
+    # 但云 VPC 中 ECS 仅有一个 ENI，入站和出站流量都在同一接口上。
+    - name: 兼容单网卡场景 — 移除 WAN/LAN 同一接口检查
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -eu
+          sed -i '/^[[:space:]]*if \[\[ "\$WAN_IF" == "\$LAN_IF" \]\]; then/,/^[[:space:]]*fi$/{
+            s/^/#AUTOPATCHED: /
+          }' /root/install_nat_gateway.sh
+          echo "已适配单网卡场景"
+      changed_when: true
+
+    - name: 消除 WAN_CONN_OK 竞态条件 — 始终提示外网连通性确认
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -eu
+          # 移除 ping 成功时跳过 WAN_CONN_OK 的条件分支，
+          # 使脚本始终提示该问题，避免非交互式答案序列错位
+          sed -i '/^    if ping -c 1 -W 3 8\.8\.8\.8.*then$/,/^    fi$/{
+            /^    if ping/d
+            /外网连通性正常/d
+            /^    else$/d
+            /^    fi$/d
+          }' /root/install_nat_gateway.sh
+          echo "已消除 WAN_CONN_OK 竞态条件"
+      changed_when: true
+
+    - name: 移除 pipefail — 避免命令替换中管道失败导致脚本退出
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -eu
+          # Bash 5.2 + pipefail + set -e 在命令替换赋值中会
+          # 因管道失败（如 grep 无匹配）导致脚本意外退出。
+          # 移除 pipefail（set -eu 而非 set -euo，避免 -o 无参数输出选项列表）
+          sed -i 's/set -euo pipefail/set -eu/' /root/install_nat_gateway.sh
+          echo "pipefail 已移除"
+      changed_when: true
+
+    - name: 修复 iptables-nft 兼容性 — -t 必须在命令之前
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -eu
+          # iptables-nft / iptables-legacy 都要求 -t <table> 在命令（-C/-A）之前，
+          # 但 _iptables_add 函数用 iptables -C "$@" 展开后变成 iptables -C -t nat ...，
+          # 导致 "Bad argument 'nat'" 错误。将函数改写为自动提取并前置 -t。
+          sed -i '/^_iptables_add() {$/,/^}$/c\
+          _iptables_add() {\
+              local _t\
+              if [[ "$1" == "-t" ]]; then _t="$2"; shift 2; fi\
+              if [[ -n "${_t:-}" ]]; then\
+                  iptables -t "$_t" -C "$@" 2>/dev/null || iptables -t "$_t" -A "$@"\
+              else\
+                  iptables -C "$@" 2>/dev/null || iptables -A "$@"\
+              fi\
+          }' /root/install_nat_gateway.sh
+          echo "iptables-nft 兼容性已修复"
+      changed_when: true
+
+    # --- 构建非交互式答案序列（始终执行以验证网络状态） ---
+    # 脚本的交互提示会根据运行环境动态变化：
+    #   - 如果 WAN IP 是私有地址 → 多一个 "是否继续？" 提示
+    #   - 如果 ping 不通外网 → 再多一个 "是否继续？" 提示
+    - name: 检测网络状态以构建正确的答案序列
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -eu
+          IFACE="{{ wan_interface.stdout }}"
+          VPC_CIDR="{{ vpc_cidr }}"
+
+          WAN_IP=$(ip -4 -o addr show "$IFACE" | awk '{split($4,a,"/"); print a[1]; exit}')
+
+          is_private() {
+              local ip="$1" IFS='.'; local -a o
+              read -ra o <<< "$ip"
+              [[ ${o[0]} -eq 10 ]] && return 0
+              [[ ${o[0]} -eq 172 && ${o[1]} -ge 16 && ${o[1]} -le 31 ]] && return 0
+              [[ ${o[0]} -eq 192 && ${o[1]} -eq 168 ]] && return 0
+              [[ ${o[0]} -eq 100 && ${o[1]} -ge 64 && ${o[1]} -le 127 ]] && return 0
+              return 1
+          }
+
+          printf '%s\n' "$IFACE"                             # 1. WAN_IF
+
+          if is_private "$WAN_IP"; then
+              printf 'y\n'                                   # 2. WAN_PRIVATE_OK
+          fi
+
+          # 始终输出 WAN_CONN_OK — 脚本已打补丁始终提示该问题
+          printf 'y\n'                                       # 3. WAN_CONN_OK
+
+          printf '%s\n' "$IFACE"                             # 4. LAN_IF
+          printf '%s\n' "$VPC_CIDR"                          # 5. LAN_SUBNET
+          printf '2\n'                                       # 6. MASQUERADE
+          printf 'n\n'                                       # 7. 不配置 DNAT
+          printf 'y\n'                                       # 8. 确认开始配置
+          printf 'y\n'                                       # 9. 清空现有规则
+      register: nat_answers
+      changed_when: false
+      check_mode: false
+
+    - name: 显示将要使用的答案序列
+      ansible.builtin.debug:
+        msg: "{{ nat_answers.stdout_lines }}"
+
+    # --- 执行 NAT 网关脚本（受 --check 影响，dry-run 时跳过） ---
+    # 策略：使用上方检测任务构建的 nat_answers 答案序列（网卡名、网段等
+    # 均来自真实环境），后续所有 y/n 提示（确认、清空规则等）由 yes 命令处理。
+    # 不再硬编码 eth0 / 172.16.0.0/16，vpc_cidr 参数化后 MASQUERADE 源网段自动匹配。
+    - name: 执行 NAT 网关配置脚本（非交互式）
+      ansible.builtin.shell: |
+        { printf '%s\n' {% for item in nat_answers.stdout_lines %}{{ item | quote }} {% endfor %}; yes; } | bash /root/install_nat_gateway.sh
+      register: nat_result
+      changed_when: true
+      async: 300
+      poll: 10
+      when: not ansible_check_mode
+
+    - name: NAT 网关脚本输出
+      ansible.builtin.debug:
+        msg: "{{ nat_result.stdout_lines | default(['(skipped in check mode)']) }}"
+
+    # --- 验证 NAT 规则（始终执行） ---
+    - name: 验证当前 iptables NAT 规则
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -eu
+          echo "=== NAT 表 POSTROUTING ==="
+          iptables -t nat -L POSTROUTING -n -v 2>/dev/null || echo "(empty)"
+          echo ""
+          echo "=== FORWARD 规则 ==="
+          iptables -L FORWARD -n -v 2>/dev/null || echo "(empty)"
+          echo ""
+          echo "=== IP 转发状态 ==="
+          sysctl net.ipv4.ip_forward
+      register: verify_nat
+      changed_when: false
+      check_mode: false
+
+    - name: 显示验证结果
+      ansible.builtin.debug:
+        msg: "{{ verify_nat.stdout_lines }}"
+
+    - name: 确认 NAT 规则已生效
+      ansible.builtin.assert:
+        that:
+          - "'MASQUERADE' in verify_nat.stdout or 'SNAT' in verify_nat.stdout"
+          - "vpc_cidr in verify_nat.stdout"
+        success_msg: "✓ NAT 规则已正确配置（{{ vpc_cidr }} 命中 MASQUERADE/SNAT）"
+        fail_msg: "✗ NAT 规则未生效或源网段不匹配 {{ vpc_cidr }} — 请检查堡垒机网卡与网段参数"
+      when: not ansible_check_mode
+
+    - name: NAT 规则检查（check 模式）
+      ansible.builtin.debug:
+        msg:
+          - "⚠️  当前处于 check 模式，NAT 规则验证已跳过"
+          - "   如果这是首次运行，请先执行: ansible-playbook ... setup-all.yml"
+      when: ansible_check_mode
+
+# ============================================================
+# Play 2: 验证内部 ECS 外网连通（经 VPC 路由表 → 堡垒机 NAT）
+# 内网 vswitch 的 VPC 路由表已含 0.0.0.0/0 → 堡垒机 ENI，
+# 内部 ECS 保持云初始化默认路由（via vrouter）即可，无需逐机改路由。
+# 历史教训：曾逐机把默认路由改为 172.16.0.62（与 ECS 不在同一 /24 网段，
+# 且无覆盖路由），导致「删旧路由 → 加新路由失败 → ECS 失联、SSH 会话
+# 死亡 → Ansible 任务无限挂起」。本 Play 只做验证，不做任何变更。
+# ============================================================
+- name: Verify internal ECS connectivity via VPC route table NAT
+  hosts: internal
+  gather_facts: yes
+  tags: [client]
+
+  tasks:
+    - name: 显示配置信息
+      ansible.builtin.debug:
+        msg:
+          - "本机: {{ inventory_hostname }} ({{ ansible_host }})"
+          - "NAT 网关（堡垒机）: {{ gateway_ip }}"
+          - "VPC CIDR: {{ vpc_cidr }}"
+
+    # --- 验证（始终执行，只读） ---
+    - name: 验证默认路由与外网连通性
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -eu
+          DEFAULT_VIA=$(ip route show default | awk '/^default/ {print $3; exit}')
+          echo "default_via=${DEFAULT_VIA:-NONE}"
+          echo "=== 默认路由 ==="
+          ip route show default 2>/dev/null || echo "(no default route)"
+          echo "=== 外网连通性测试 ==="
+          if ping -c 2 -W 3 8.8.8.8 >/dev/null 2>&1; then echo "PING_OK"; else echo "PING_FAIL"; fi
+      register: verify_client
+      changed_when: false
+      check_mode: false
+
+    - name: 显示验证结果
+      ansible.builtin.debug:
+        msg: "{{ verify_client.stdout_lines }}"
+
+    - name: 确认默认路由存在
+      ansible.builtin.assert:
+        that:
+          - "'default_via=NONE' not in verify_client.stdout"
+        success_msg: "✓ {{ inventory_hostname }} 默认路由存在（via vrouter，外网流量由 VPC 路由表转发至堡垒机 NAT）"
+        fail_msg: "✗ {{ inventory_hostname }} 缺少默认路由 — 请检查云初始化/DHCP 配置"
+      when: not ansible_check_mode
+
+    - name: 确认外网连通性（经 VPC 路由表 → 堡垒机 NAT）
+      ansible.builtin.assert:
+        that:
+          - "'PING_OK' in verify_client.stdout"
+        success_msg: "✓ {{ inventory_hostname }} 外网可达（经 VPC 路由表 → 堡垒机 NAT）"
+        fail_msg: "✗ {{ inventory_hostname }} 外网不通 — 请检查堡垒机 NAT 规则（Play 1 输出）与 VPC 路由表（0.0.0.0/0 → 堡垒机 ENI）"
+      when: not ansible_check_mode
+
+    - name: 路由检查（check 模式）
+      ansible.builtin.debug:
+        msg:
+          - "⚠️  当前处于 check 模式，路由验证已跳过"
+          - "   如果这是首次运行，请先执行: ansible-playbook ... setup-all.yml"
+      when: ansible_check_mode
+
+# ============================================================
+# Play 3: 汇总
+# ============================================================
+- name: 配置完成汇总
+  hosts: all
+  gather_facts: no
+  tags: [always]
+
+  tasks:
+    - name: 汇总
+      ansible.builtin.debug:
+        msg:
+          - "=========================================="
+          - "  🎉 NAT 网关配置完成！"
+          - "=========================================="
+          - ""
+          - "NAT 网关 ECS: {{ groups['nat_gateway'] | default([]) | join(', ') }}"
+          - "公网设备:     {{ groups['public'] | default([]) | join(', ') }}"
+          - "内部 ECS:     {{ groups['internal'] | default([]) | join(', ') }}"
+          - ""
+          - "验证步骤:"
+          - "  1. 登录内部 ECS: ssh -J root@<堡垒机公网IP> root@<内部ECS内网IP>"
+          - "  2. 测试外网: ping 8.8.8.8（经 VPC 路由表 → 堡垒机 NAT）"
+          - ""
+          - "回滚操作:"
+          - "  NAT 网关: ssh root@<堡垒机公网IP> 'bash /root/rollback_nat.sh'"
+          - "  内部 ECS: 无需配置（VPC 路由表 0.0.0.0/0 → 堡垒机 ENI 负责转发）"
+          - "=========================================="

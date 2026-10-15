@@ -1,0 +1,420 @@
+# ============================================================
+# Ansible Playbook: 在堡垒机上部署 NetBird 服务端
+# ============================================================
+#
+# 部署内容: traefik:v3.6 + netbird-dashboard + netbird-server (combined)
+#           三个容器，域名采用堡垒机域名（如 bastion.ohmynet.vip），
+#           由 netbird-install-*.tar.gz 离线安装包静默安装。
+#
+# 使用方法:
+#   # 预览变更（检测/预检任务仍会执行，变更类任务跳过）
+#   ansible-playbook playbooks/setup-netbird.yml --check
+#
+#   # 执行（Let's Encrypt 邮箱必填）
+#   ansible-playbook playbooks/setup-netbird.yml \
+#     -e netbird_letsencrypt_email=admin@example.com
+#
+#   # 已安装过时强制覆盖重装（配置文件重建，数据卷保留）
+#   ansible-playbook playbooks/setup-netbird.yml \
+#     -e netbird_letsencrypt_email=admin@example.com -e netbird_force=1
+#
+#   # 初始 admin 自动注册（默认 admin / admin@ohmynet.vip / QWe123.456，可覆盖）:
+#   # 安装/重装完成后调用管理服务无认证引导接口 POST /api/setup 直接创建
+#   # owner 用户（密码明文提交、服务端内部 bcrypt，不修改安装包/config.yaml）。
+#   # 初始化前先 GET /api/instance 预检 setup_required，已初始化（已存在账号）
+#   # 则跳过；初始化后在堡垒机侧用 get_setup_key.sh 实际登录验证（设备码流程，
+#   # 仅登录不创建 setup key）。
+#   ansible-playbook playbooks/setup-netbird.yml \
+#     -e netbird_letsencrypt_email=admin@example.com \
+#     -e netbird_admin_email=admin@ohmynet.vip -e netbird_admin_password=QWe123.456
+#
+# 域名来源（优先级）:
+#   1. -e netbird_domain=<域名>   显式指定
+#   2. inventory 堡垒机 hostvar netbird_domain（generate_inventory.sh 自动生成，
+#      即 terraform dns_records 中堡垒机的完整域名，如 bastion.ohmynet.vip）
+#
+# 前置条件:
+#   - terraform apply + ./inventory/generate_inventory.sh --write
+#   - 堡垒机已安装 Docker + compose 插件（未安装先执行:
+#       ansible-playbook playbooks/setup-docker.yml -l nat_gateway）
+#   - 安全组已放行 80/443 tcp + 3478/udp（vpc.tf 中 allow_stun 规则，apply 后生效）
+#   - 堡垒机域名 A 记录已解析到其公网 IP（dns.tf 自动创建）
+# ============================================================
+
+- name: Deploy NetBird server on bastion (nat_gateway)
+  hosts: nat_gateway
+  gather_facts: yes
+  tags: [netbird]
+
+  vars:
+    # 本地离线安装包（netbird-install-<日期>.tar.gz），可用 -e netbird_package=... 覆盖
+    # 20260816 版: install.sh 的 exposedAddress 补 :443（客户端 signal/relay URL 无端口导致连接失败）
+    netbird_package: /home/ywhking/develop/netbird-install-20260816.tar.gz
+    # 目标机解压安装目录
+    netbird_install_dir: /opt/netbird-install
+    # ---- 初始 admin 自动注册（POST /api/setup，默认 admin / admin@ohmynet.vip / QWe123.456）----
+    # 原理: netbird-server 嵌入式 IDP 模式提供无认证引导接口 POST /api/setup，
+    #       直接创建初始 owner 用户；密码明文提交、服务端内部 bcrypt（≥8 字符）。
+    #       不修改安装包/config.yaml，也不依赖控制机 python3-bcrypt。
+    netbird_admin_name: "admin"                # 显示名（登录用户名即邮箱）
+    netbird_admin_email: "admin@ohmynet.vip"   # -e netbird_admin_email=... 覆盖
+    netbird_admin_password: "QWe123.456"       # -e netbird_admin_password=... 覆盖
+    # get_setup_key.sh（堡垒机侧验证 admin 登录用）
+    netbird_setup_key_script: "{{ playbook_dir }}/../../scripts/get_setup_key.sh"
+
+  tasks:
+    # --- 预检（只读，始终执行） ---
+    - name: 预检 Docker 与 compose 插件
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -eu
+          docker --version >/dev/null 2>&1 || { echo "NO_DOCKER"; exit 0; }
+          docker compose version >/dev/null 2>&1 || { echo "NO_COMPOSE"; exit 0; }
+          echo "DOCKER_OK"
+      register: docker_check
+      changed_when: false
+      check_mode: false
+
+    - name: 确认 Docker 已就绪
+      ansible.builtin.assert:
+        that:
+          - "'DOCKER_OK' in docker_check.stdout"
+        success_msg: "✓ 堡垒机 Docker 与 compose 插件已就绪"
+        fail_msg: "✗ 堡垒机缺少 Docker 或 compose 插件 — 请先执行: ansible-playbook playbooks/setup-docker.yml -l nat_gateway"
+      when: not ansible_check_mode
+
+    # install.sh 就绪检查依赖 curl（Ubuntu 24.04 默认不带），缺失时自动安装
+    - name: 预检 curl
+      ansible.builtin.shell: command -v curl >/dev/null 2>&1 && echo OK || echo MISSING
+      register: curl_check
+      changed_when: false
+      check_mode: false
+
+    - name: 安装 curl（缺失时）
+      ansible.builtin.apt:
+        name: curl
+        state: present
+        update_cache: yes
+      when: "'MISSING' in curl_check.stdout"
+
+    # --- 确定部署域名与邮箱 ---
+    # 优先级: -e netbird_domain > inventory 堡垒机 netbird_domain > 空（assert 拦截）
+    - name: 确定 NetBird 部署域名
+      ansible.builtin.set_fact:
+        netbird_domain_final: "{{ netbird_domain | default(hostvars[inventory_hostname].netbird_domain | default(''), true) }}"
+
+    - name: 显示部署参数
+      ansible.builtin.debug:
+        msg:
+          - "目标主机: {{ inventory_hostname }} ({{ ansible_host }})"
+          - "部署域名: {{ netbird_domain_final }}"
+          - "Let's Encrypt 邮箱: {{ netbird_letsencrypt_email | default('（未设置）') }}"
+          - "安装包: {{ netbird_package }}"
+          - "安装目录: {{ netbird_install_dir }}"
+
+    - name: 校验域名（须为公网域名，Let's Encrypt 无法为 IP 签发）
+      ansible.builtin.assert:
+        that:
+          - netbird_domain_final != ''
+          - netbird_domain_final is not match('^[0-9.]+$')
+          - netbird_domain_final is not match('^[0-9a-fA-F:]+$')
+          - netbird_domain_final != 'localhost'
+        fail_msg: >-
+          无法确定 NetBird 部署域名 — 请用 -e netbird_domain=<域名> 显式指定，
+          或先重跑 ./inventory/generate_inventory.sh --write 生成堡垒机 netbird_domain
+          （当前值: '{{ netbird_domain_final }}'）
+
+    - name: 校验 Let's Encrypt 邮箱（必填）
+      ansible.builtin.assert:
+        that:
+          - netbird_letsencrypt_email is defined
+          - netbird_letsencrypt_email != ''
+          # Let's Encrypt 拒绝保留域名/占位邮箱（RFC 2606），如 example.com —
+          # 否则 ACME 注册会失败（invalidContact），安装将等待 180s 后超时
+          - netbird_letsencrypt_email is not search('@(example|test|invalid)\.(com|org|net|edu)$')
+          - netbird_letsencrypt_email is not search('@localhost')
+          - netbird_letsencrypt_email is not match('^[^@]*@[0-9.]+$')
+          - netbird_letsencrypt_email is not match('^[^@]*@[0-9a-fA-F:]+$')
+        fail_msg: >-
+          必须提供真实的 Let's Encrypt 通知邮箱: -e netbird_letsencrypt_email=admin@example.com。
+          注意 example.com 等保留域名会被 Let's Encrypt 拒绝（invalidContact），须用真实邮箱。
+
+    # --- 已有安装检测（重跑幂等） ---
+    - name: 检测已有安装
+      ansible.builtin.stat:
+        path: "{{ netbird_install_dir }}/docker-compose.yml"
+      register: existing_install
+
+    - name: 提示已有安装
+      ansible.builtin.debug:
+        msg:
+          - "⚠️  检测到已有安装（{{ netbird_install_dir }}/docker-compose.yml），跳过安装"
+          - "   如需覆盖重装（数据卷保留）: -e netbird_force=1"
+      when: existing_install.stat.exists and not (netbird_force | default(false) | bool)
+
+    # --- 上传并解压安装包（已安装且非 force 时跳过） ---
+    # unarchive 模块要求 dest 目录预先存在（tar 本身会自动建目录，但模块会先校验）
+    - name: 创建安装目录 {{ netbird_install_dir }}
+      ansible.builtin.file:
+        path: "{{ netbird_install_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: 上传 NetBird 安装包到堡垒机
+      ansible.builtin.copy:
+        src: "{{ netbird_package }}"
+        dest: "/opt/{{ netbird_package | basename }}"
+        owner: root
+        group: root
+        mode: "0644"
+      when: not existing_install.stat.exists or (netbird_force | default(false) | bool)
+
+    - name: 解压安装包到 {{ netbird_install_dir }}
+      ansible.builtin.unarchive:
+        src: "/opt/{{ netbird_package | basename }}"
+        dest: "{{ netbird_install_dir }}/"
+        remote_src: true
+        owner: root
+        group: root
+      # 不能用 creates 幂等: creates 命中时任务直接跳过，force 重装时新包中的
+      # 新增镜像 tar 将无法落地（install.sh 已存在即跳过）。改用与上传一致的
+      # when 条件: 首次安装或 force 时总是重新解压；已装且非 force 时跳过。
+      when: not existing_install.stat.exists or (netbird_force | default(false) | bool)
+
+    # --- 离线包完整性预检（只读，始终执行） ---
+    # 包内必须含 traefik 镜像 tar，否则 docker compose up 会尝试连接 Docker Hub
+    # （中国区 ECS 直连超时）。安装包未包含 traefik 时提前报错，避免浪费时间。
+    - name: 预检离线包内含 traefik 镜像
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -eu
+          # docker save 的 tar 文件名全是 sha256 hash，traefik 字样只在 manifest.json
+          # 内容的 RepoTags 里（旧格式在 repositories 文件），须解压到 stdout 后 grep 内容
+          found=0
+          for f in {{ netbird_install_dir }}/images/*.tar; do
+            if tar xOf "$f" manifest.json 2>/dev/null | grep -q 'traefik' \
+              || tar xOf "$f" repositories 2>/dev/null | grep -q 'traefik'; then
+              found=1
+              break
+            fi
+          done
+          [[ $found -eq 1 ]] && echo "TRAEFIK_IN_PACKAGE" || echo "TRAEFIK_MISSING"
+      register: pkg_traefik
+      changed_when: false
+      check_mode: false
+
+    - name: 确认离线包含 traefik 镜像
+      ansible.builtin.assert:
+        that:
+          - "'TRAEFIK_IN_PACKAGE' in pkg_traefik.stdout"
+        success_msg: "✓ 离线包已含 traefik 镜像（无需访问 Docker Hub）"
+        fail_msg: >-
+          ✗ 目标机 {{ netbird_install_dir }}/images/ 不含 traefik 镜像 —
+          docker compose 将尝试在线拉取 traefik:v3.6 而失败。
+          1) 确认安装包已含 traefik: tar tzf {{ netbird_package | basename }} | grep traefik
+          2) 若包内有但目标机没有，说明解压未生效（force 重装时解压任务不应被跳过）
+          3) 打包命令: docker pull traefik:v3.6 && docker save traefik:v3.6 -o images/traefik-v3.6.tar
+      when: not ansible_check_mode
+
+    # --- 执行安装（受 --check 影响，dry-run 时跳过） ---
+    # 参考官方流程: cd /opt/netbird-install && ./install.sh <域名> <邮箱>
+    # 参数全部走环境变量静默安装；首次需等 Let's Encrypt 签发证书（约 3 分钟内）。
+    - name: 执行 NetBird 安装脚本（静默）
+      ansible.builtin.shell: bash {{ netbird_install_dir }}/install.sh
+      args:
+        chdir: "{{ netbird_install_dir }}"
+      environment:
+        NETBIRD_DOMAIN: "{{ netbird_domain_final }}"
+        NETBIRD_LETSENCRYPT_EMAIL: "{{ netbird_letsencrypt_email }}"
+        INSTALL_FORCE: "{{ '1' if (netbird_force | default(false) | bool) else '' }}"
+      register: netbird_install
+      async: 900
+      poll: 10
+      when: not ansible_check_mode and (not existing_install.stat.exists or (netbird_force | default(false) | bool))
+
+    - name: 安装脚本输出
+      ansible.builtin.debug:
+        msg: "{{ netbird_install.stdout_lines | default(['(skipped in check mode)']) }}"
+
+    # --- 验证（始终执行，只读） ---
+    - name: 验证容器状态与 Dashboard 就绪
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          cd {{ netbird_install_dir }}
+          echo "=== 容器状态 ==="
+          docker compose ps || true
+          echo "=== Dashboard 就绪检查 ==="
+          curl -sk -o /dev/null -w 'https://{{ netbird_domain_final }} -> HTTP %{http_code}\n' \
+            https://{{ netbird_domain_final }}/oauth2/.well-known/openid-configuration || echo "curl 检查失败"
+      register: netbird_verify
+      changed_when: false
+      check_mode: false
+
+    - name: 显示验证结果
+      ansible.builtin.debug:
+        msg: "{{ netbird_verify.stdout_lines }}"
+
+    - name: 确认服务已就绪
+      ansible.builtin.assert:
+        that:
+          - "'netbird-traefik' in netbird_verify.stdout"
+          - "'netbird-dashboard' in netbird_verify.stdout"
+          - "'netbird-server' in netbird_verify.stdout"
+          - "'HTTP 200' in netbird_verify.stdout"
+        success_msg: "✓ NetBird 服务端部署完成并可访问 https://{{ netbird_domain_final }}"
+        fail_msg: "✗ 容器未全部运行或 Dashboard 未就绪 — 请检查: docker compose logs netbird-server / traefik"
+      when: not ansible_check_mode
+
+    # ============================================================
+    # 初始 admin 自动注册（POST /api/setup）
+    # 原理: netbird-server 嵌入式 IDP 模式提供无认证引导接口——
+    #       GET  /api/instance  → {"setup_required": bool} 预检是否已初始化
+    #       POST /api/setup     → 创建初始 owner 用户（一次性接口：已存在
+    #                             账号时返回 412 "setup already completed"）。
+    #       密码明文提交，bcrypt 由服务端内部处理；无需控制机 python3-bcrypt，
+    #       无需修改安装包或 config.yaml。
+    # 注意: 若堡垒机上已通过 Dashboard 引导创建过其他管理员（setup_required
+    #       = false），预检命中直接跳过——不会追加第二个 owner。
+    # ============================================================
+    - name: 预检实例是否已初始化（GET /api/instance）
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -u
+          resp=$(curl -sk -m 60 "$MGMT_URL/api/instance" 2>/dev/null)
+          echo "$resp" | python3 -c 'import sys,json
+          try:
+              print("setup_required=" + str(json.load(sys.stdin).get("setup_required", "")))
+          except Exception:
+              print("UNPARSEABLE")'
+      environment:
+        MGMT_URL: "https://{{ netbird_domain_final }}"
+      register: instance_check
+      changed_when: false
+      check_mode: false
+
+    - name: 显示初始化检测结果
+      ansible.builtin.debug:
+        msg: "实例初始化状态: {{ instance_check.stdout }}"
+
+    - name: 初始化 admin（POST /api/setup；已初始化时接口返回 412 自动跳过）
+      ansible.builtin.shell:
+        executable: /bin/bash
+        cmd: |
+          set -u
+          code=$(curl -sk -m 60 -o /tmp/nb_setup_resp.json -w '%{http_code}' \
+            -X POST "$MGMT_URL/api/setup" -H 'Content-Type: application/json' \
+            -d "{\"email\":\"$EMAIL\",\"name\":\"$NAME\",\"password\":\"$PASSWORD\"}")
+          echo "HTTP_CODE=$code"
+          [[ -s /tmp/nb_setup_resp.json ]] && cat /tmp/nb_setup_resp.json
+          rm -f /tmp/nb_setup_resp.json
+      environment:
+        MGMT_URL: "https://{{ netbird_domain_final }}"
+        EMAIL: "{{ netbird_admin_email }}"
+        NAME: "{{ netbird_admin_name }}"
+        PASSWORD: "{{ netbird_admin_password }}"
+      register: admin_setup
+      changed_when: "'HTTP_CODE=200' in admin_setup.stdout"
+      when:
+        - not ansible_check_mode
+        # setup_required=False 已初始化 → 跳过；True / UNPARSEABLE（旧版本
+        # 无 /api/instance）→ 尝试 POST，由接口 412 兜底判断
+        - "'setup_required=False' not in instance_check.stdout"
+
+    - name: 提示已初始化（/api/setup 返回 412）
+      ansible.builtin.debug:
+        msg: "⚠️ 实例已初始化（POST /api/setup 返回 412 setup already completed），跳过 admin 初始化"
+      when:
+        - admin_setup is defined
+        - "'HTTP_CODE=412' in admin_setup.stdout"
+
+    - name: 确认 admin 初始化成功
+      ansible.builtin.assert:
+        that:
+          - "'HTTP_CODE=200' in admin_setup.stdout or 'HTTP_CODE=412' in admin_setup.stdout"
+        success_msg: "✓ 初始 admin 创建成功（{{ netbird_admin_email }}）"
+        fail_msg: >-
+          ✗ /api/setup 调用异常（输出: {{ admin_setup.stdout }}）— 请检查:
+          1) netbird-server 是否支持 /api/setup（嵌入式 IDP 模式，旧版本无此接口）
+          2) docker compose logs netbird-server --tail=50
+          3) 堡垒机到 https://{{ netbird_domain_final }} 连通性（hairpin）
+      when: admin_setup is defined
+
+    # --- 验证 admin 登录（堡垒机侧设备码流程，仅登录不建 key，全程无需浏览器）---
+    # 证明: /api/setup 返回 200 已保证账号为 owner 且可登录（服务端原子写入
+    #       内嵌 Dex 存储），这里只做端到端登录冒烟测试——设备码 → Dex 登录
+    #       表单 → token → /api/users/current，校验真实登录链路可用。
+    # 在堡垒机执行而非控制机: 控制机到管理服务器路径存在 TLS 关键字
+    # 干扰（域名含 vpn 被 DPI 阻断），堡垒机走自身公网 IP hairpin 可达
+    - name: 上传 get_setup_key.sh 到堡垒机（登录验证用）
+      ansible.builtin.copy:
+        src: "{{ netbird_setup_key_script }}"
+        dest: /root/get_setup_key.sh
+        owner: root
+        group: root
+        mode: "0755"
+      when: not ansible_check_mode
+
+    - name: 验证 admin 登录（堡垒机执行，仅登录不创建 setup key）
+      ansible.builtin.shell: bash /root/get_setup_key.sh --no-key
+      args:
+        executable: /bin/bash
+      environment:
+        MGMT_URL: "https://{{ netbird_domain_final }}"
+        EMAIL: "{{ netbird_admin_email }}"
+        PASSWORD: "{{ netbird_admin_password }}"
+      register: admin_login_verify
+      changed_when: "'当前用户:' in admin_login_verify.stdout"
+      when:
+        - not ansible_check_mode
+        - admin_setup is defined
+        - admin_setup is changed   # 仅本次实际初始化后验证，已初始化跳过时不重复验证
+
+    - name: 确认 admin 登录验证通过
+      ansible.builtin.assert:
+        that:
+          - "'当前用户:' in admin_login_verify.stdout"
+        success_msg: "✓ 初始 admin 登录验证通过（{{ netbird_admin_email }}）"
+        fail_msg: >-
+          ✗ admin 登录验证失败（{{ netbird_admin_email }}）— 请检查:
+          1) docker compose logs netbird-server --tail=50（Dex 初始化错误）
+          2) 堡垒机到 https://{{ netbird_domain_final }} 连通性（hairpin / DPI）
+          3) 密码是否与 /api/setup 创建时一致（-e netbird_admin_password=... 可重置重跑）
+      when:
+        - not ansible_check_mode
+        - admin_setup is defined
+        - admin_setup is changed
+
+    - name: 部署汇总
+      ansible.builtin.debug:
+        msg:
+          - "=========================================="
+          - "  🎉 NetBird 服务端部署完成！"
+          - "=========================================="
+          - ""
+          - "Dashboard: https://{{ netbird_domain_final }}"
+          - "客户端接入: netbird up --management-url https://{{ netbird_domain_final }}"
+          - ""
+          - "初始管理员（自动注册，登录 Dashboard 使用）:"
+          - "  显示名: {{ netbird_admin_name }}（登录用户名即邮箱）"
+          - "  邮箱:   {{ netbird_admin_email }}"
+          - "  密码:   {{ netbird_admin_password }}"
+          - "  ⚠️  登录后请立即修改密码（或重跑本 playbook 时 -e netbird_admin_password=新密码）"
+          - ""
+          - "开放端口:"
+          - "  80/tcp    (HTTP → 重定向 HTTPS)"
+          - "  443/tcp   (HTTPS - 所有 NetBird 服务)"
+          - "  3478/udp  (STUN - NAT 穿透必需，安全组 allow_stun 规则)"
+          - ""
+          - "排障:"
+          - "  ssh -i keys/KEY-<堡垒机名> root@{{ ansible_host }}"
+          - "  cd {{ netbird_install_dir }} && docker compose logs netbird-server"
+          - "  重装: -e netbird_force=1（数据卷保留）；卸载: bash uninstall.sh"
+          - ""
+          - "注意: 若本 Play 在 check 模式运行，以上为预期结果，未实际部署"
+          - "=========================================="
