@@ -189,17 +189,18 @@ def test_execute_create_marks_succeeded(db_factory):
 
     # netbird 的 extra vars 只挂在 setup-netbird.yml 上（不是 setup-netbird-agent.yml）。
     # email 取自 Settings（测试 env 里设置的真实地址），不是硬编码的 example.com
-    # 占位符——那个值会被 playbook 的 assert 直接拒绝。domain 由 bastion 推导。
+    # 占位符——那个值会被 playbook 的 assert 直接拒绝。domain 由 bastion 推导，
+    # 且必须带上租户子域名（见 test_netbird_domain_includes_the_tenant_subdomain）。
     s = get_settings()
     assert _extra_args_for(fake, NETBIRD) == [
         "-e",
-        f"netbird_domain=bastion.{s.platform_domain}",
+        f"netbird_domain=bastion.acme.{s.platform_domain}",
         "-e",
         f"netbird_letsencrypt_email={s.netbird_letsencrypt_email}",
     ]
     assert _extra_args_for(fake, NETBIRD_AGENT) == [
         "-e",
-        f"netbird_management_url=https://bastion.{s.platform_domain}",
+        f"netbird_management_url=https://bastion.acme.{s.platform_domain}",
     ]
     assert _extra_args_for(fake, NETWORK) == []
     assert _extra_args_for(fake, DOCKER) == []
@@ -258,7 +259,7 @@ def test_playbook_inputs_go_to_the_right_playbook_only(db_factory, monkeypatch):
         "-e",
         "netbird_package=/opt/netbird-install.tar.gz",
         "-e",
-        "netbird_domain=bastion.mynet.vip",
+        "netbird_domain=bastion.acme.mynet.vip",
         "-e",
         "netbird_letsencrypt_email=ops@mynet.vip",
     ]
@@ -266,7 +267,7 @@ def test_playbook_inputs_go_to_the_right_playbook_only(db_factory, monkeypatch):
         "-e",
         "netbird_binary=/opt/netbird/netbird",
         "-e",
-        "netbird_management_url=https://bastion.mynet.vip",
+        "netbird_management_url=https://bastion.acme.mynet.vip",
     ]
     assert _extra_args_for(fake, DOCKER) == [
         "-e",
@@ -275,6 +276,30 @@ def test_playbook_inputs_go_to_the_right_playbook_only(db_factory, monkeypatch):
         "docker_mirrors=https://docker.m.daocloud.io",
     ]
     assert _extra_args_for(fake, NETWORK) == []
+
+
+def test_netbird_domain_includes_the_tenant_subdomain(db_factory, monkeypatch):
+    """回归保护：bastion 的 FQDN 必须包含租户子域名。
+
+    `tfvars.py` 把 terraform 的 `domain_name`（DNS zone）写成
+    `"<subdomain>.<platform_domain>"`，`terraform/dns.tf` 再在其中以
+    `rr = <实例 domain_name>` 建 A 记录，所以 bastion 实际解析在
+    `bastion.<subdomain>.<platform_domain>`。写成 `bastion.<platform_domain>`
+    会指向一个没有 A 记录的名字，并且让所有租户的 bastion 抢同一个主机名。
+    """
+    settings = Settings(netbird_letsencrypt_email="ops@mynet.vip", platform_domain="mynet.vip")
+    fake = _run_with_settings(db_factory, monkeypatch, settings)
+
+    assert _extra_args_for(fake, NETBIRD) == [
+        "-e",
+        "netbird_domain=bastion.acme.mynet.vip",
+        "-e",
+        "netbird_letsencrypt_email=ops@mynet.vip",
+    ]
+    assert _extra_args_for(fake, NETBIRD_AGENT) == [
+        "-e",
+        "netbird_management_url=https://bastion.acme.mynet.vip",
+    ]
 
 
 def test_optional_playbook_inputs_absent_when_unset(db_factory, monkeypatch):
@@ -286,13 +311,13 @@ def test_optional_playbook_inputs_absent_when_unset(db_factory, monkeypatch):
 
     assert _extra_args_for(fake, NETBIRD) == [
         "-e",
-        "netbird_domain=bastion.mynet.vip",
+        "netbird_domain=bastion.acme.mynet.vip",
         "-e",
         "netbird_letsencrypt_email=ops@mynet.vip",
     ]
     assert _extra_args_for(fake, NETBIRD_AGENT) == [
         "-e",
-        "netbird_management_url=https://bastion.mynet.vip",
+        "netbird_management_url=https://bastion.acme.mynet.vip",
     ]
     assert _extra_args_for(fake, DOCKER) == []
 

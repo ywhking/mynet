@@ -86,12 +86,14 @@ def _netbird_domain(config: DeploymentConfig, settings) -> str:
 
     `tfvars.py` writes `domain_name = "<subdomain>.<platform_domain>"` as the DNS
     *zone* and `terraform/dns.tf` creates one A record per public instance with
-    `rr = <instance domain_name>`, so the bastion resolves at
-    `<bastion.domain_name>.<platform_domain>`.
+    `rr = <instance domain_name>` *inside that zone*, so the bastion resolves at
+    `<bastion.domain_name>.<subdomain>.<platform_domain>` (e.g.
+    `bastion.acme.mynet.vip`). Dropping the tenant subdomain would both point at a
+    name with no A record and collide every tenant's bastion on the same hostname.
     """
     for inst in config.public_devices.instances.values():
         if inst.is_bastion and inst.domain_name:
-            return f"{inst.domain_name}.{settings.platform_domain}"
+            return f"{inst.domain_name}.{config.subdomain}.{settings.platform_domain}"
     return ""
 
 

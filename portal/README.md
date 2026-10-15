@@ -21,7 +21,7 @@
 | `JWT_SECRET_KEY` | 会话 token 的签名密钥。**必填**：内置默认值 `dev-secret-change-me` 已随源码公开，知道它的人可以为任意邮箱伪造 token，等于拿到所有租户的部署。生成：`python -c "import secrets; print(secrets.token_urlsafe(48))"` |
 | `ALICLOUD_ACCESS_KEY` / `ALICLOUD_SECRET_KEY` | 平台的阿里云凭据，`terraform apply` 用 |
 | `NETBIRD_LETSENCRYPT_EMAIL` | NetBird 服务端的 ACME 通知邮箱。**必填**，且不能是 `@example` / `@test` / `@invalid` 占位地址（`setup-netbird.yml` 会 assert 拒绝） |
-| `PLATFORM_DOMAIN` | 已接入云解析 DNS 的主域名，部署域名 = `<subdomain>.<PLATFORM_DOMAIN>` |
+| `PLATFORM_DOMAIN` | 已接入云解析 DNS 的主域名。租户的 DNS zone 是 `<subdomain>.<PLATFORM_DOMAIN>`，每个实例的 FQDN 则是 `<instance domain_name>.<subdomain>.<PLATFORM_DOMAIN>`（如 bastion 的 `bastion.acme.mynet.vip`） |
 | `NETBIRD_PACKAGE` / `NETBIRD_BINARY` | `setup-netbird.yml` / `setup-netbird-agent.yml` 的离线包与二进制路径。留空则用 playbook 内置默认值，而那个默认值是作者机器上的绝对路径（`/home/ywhking/develop/...`），**换台机器必须显式设置** |
 | `DOCKER_REPO_BASE` / `DOCKER_MIRRORS` | 中国区装 Docker 的 apt 源与镜像加速器（`download.docker.com` 会被 GFW 间歇性 RST） |
 
