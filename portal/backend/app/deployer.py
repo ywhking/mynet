@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -18,10 +19,20 @@ class Deployer(Protocol):
     def terraform_apply(self, var_file: str, cwd: str, env: dict[str, str]) -> str: ...
     def terraform_destroy(self, var_file: str, cwd: str, env: dict[str, str]) -> str: ...
     def generate_inventory(
-        self, script_path: str, cwd: str, env: dict[str, str], terraform_dir: str | None = None
+        self,
+        script_path: str,
+        cwd: str,
+        env: dict[str, str],
+        terraform_dir: str | None = None,
+        out_path: str | None = None,
     ) -> str: ...
     def run_ansible(
-        self, playbook: str, cwd: str, env: dict[str, str], extra_args: list[str] | None = None
+        self,
+        playbook: str,
+        cwd: str,
+        env: dict[str, str],
+        extra_args: list[str] | None = None,
+        inventory_path: str | None = None,
     ) -> str: ...
 
 
@@ -54,8 +65,6 @@ class RealDeployer:
         self.timeout = timeout
 
     def _run(self, cmd: list[str], cwd: str, env: dict[str, str]) -> str:
-        import os
-
         merged = {**os.environ, **env}
         try:
             proc = subprocess.run(
@@ -140,6 +149,7 @@ class RealDeployer:
         cwd: str,
         env: dict[str, str],
         terraform_dir: str | None = None,
+        out_path: str | None = None,
     ) -> str:
         # bash resolves a relative script argument against the *child's* cwd, which
         # subprocess sets to `cwd`. Passing a cwd-relative script_path straight through
@@ -148,10 +158,13 @@ class RealDeployer:
         # absolute path so the child's cwd cannot influence it at all: a plain join is
         # not enough, because with a relative `cwd` (e.g. "../../terraform/ansible")
         # the joined path is still relative and gets re-resolved the same way.
-        import os
-
         path = script_path if os.path.isabs(script_path) else os.path.abspath(os.path.join(cwd, script_path))
         cmd = ["bash", path, "--write"]
+        if out_path:
+            # Without this the script writes into its own directory
+            # (`ansible/inventory/hosts.yml`) — one global file shared by every
+            # tenant. Absolute for the same child-cwd reason as `path` above.
+            cmd.append(os.path.abspath(out_path))
         if terraform_dir:
             # The script otherwise derives its terraform directory from its own
             # location (always the shared `terraform/`), so a tenant run would read
@@ -161,6 +174,18 @@ class RealDeployer:
         return self._run(cmd, cwd, env)
 
     def run_ansible(
-        self, playbook: str, cwd: str, env: dict[str, str], extra_args: list[str] | None = None
+        self,
+        playbook: str,
+        cwd: str,
+        env: dict[str, str],
+        extra_args: list[str] | None = None,
+        inventory_path: str | None = None,
     ) -> str:
-        return self._run([self.ansible_bin, playbook, *(extra_args or [])], cwd, env)
+        cmd = [self.ansible_bin]
+        if inventory_path:
+            # `-i` REPLACES the `inventory` setting in ansible.cfg (it does not
+            # merge), which is what makes each tenant's run read its own file
+            # instead of the shared `ansible/inventory/hosts.yml`.
+            cmd += ["-i", os.path.abspath(inventory_path)]
+        cmd += [playbook, *(extra_args or [])]
+        return self._run(cmd, cwd, env)

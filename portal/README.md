@@ -66,9 +66,14 @@ vite dev server 默认监听 http://localhost:5173，并把 `/api` 代理到 htt
 
 `terraform/.tenants/` 已加入 `terraform/.gitignore`，不要提交。
 
-> 已知限制：`terraform/ansible/inventory/generate_inventory.sh` 仍从 `terraform/`
-> （而不是租户目录）读取 `terraform.tfstate` 与 `keys/`。单租户部署不受影响，
-> 但 inventory 生成不会自动跟随租户目录——需要改 ansible 资产，本分支未做。
+> inventory 生成（`generate_inventory.sh`）同样按租户隔离：后端同时传
+> `--terraform-dir <租户工作目录>`（读该租户的 `terraform.tfstate` 与 `keys/`，
+> 而不是共享的 `terraform/`）与 `--write <租户工作目录>/hosts.yml`（写进该租户
+> 目录，不再共用全局的 `ansible/inventory/hosts.yml`），随后 4 个 playbook 都以
+> `-i <同一份>` 读回。
+>
+> 运维直接跑 `terraform/deploy-all.sh` 时仍是不带参数的 `--write`，用全局那份——
+> 该流程不受影响。
 
 ## E2E 冒烟测试
 

@@ -1,3 +1,4 @@
+import os
 import threading
 import time
 
@@ -33,6 +34,7 @@ class FakeDeployer:
         self.raise_on = raise_on
         self.calls: list[str] = []
         self.ansible_calls: list[tuple[str, list[str]]] = []
+        self.ansible_inventories: list[str | None] = []
         self.apply_count = 0
         self.workdirs: list[str] = []
 
@@ -59,14 +61,16 @@ class FakeDeployer:
         assert cwd == self.workdirs[-1], (cwd, self.workdirs)
         return "destroyed"
 
-    def generate_inventory(self, script_path, cwd, env, terraform_dir=None):
+    def generate_inventory(self, script_path, cwd, env, terraform_dir=None, out_path=None):
         self.calls.append("inventory")
         self.inventory_terraform_dir = terraform_dir
+        self.inventory_out_path = out_path
         return "inventory written"
 
-    def run_ansible(self, playbook, cwd, env, extra_args=None):
+    def run_ansible(self, playbook, cwd, env, extra_args=None, inventory_path=None):
         self.calls.append(playbook)
         self.ansible_calls.append((playbook, list(extra_args or [])))
+        self.ansible_inventories.append(inventory_path)
         return f"ran {playbook}"
 
 
@@ -191,6 +195,12 @@ def test_execute_create_marks_succeeded(db_factory):
     # inventory 必须针对本租户的工作目录生成：脚本默认按自身位置推导 terraform
     # 目录（共享的 terraform/），不传就会读到平台自己的 state 与私钥。
     assert fake.inventory_terraform_dir == fake.workdirs[-1]
+
+    # 且必须写进该租户目录（默认会写进脚本自身目录下全局共用的 hosts.yml），
+    # 4 个 playbook 都要用 `-i` 读回同一份，否则会给租户 B 部署租户 A 的主机。
+    expected_inventory = os.path.join(fake.workdirs[-1], "hosts.yml")
+    assert fake.inventory_out_path == expected_inventory
+    assert fake.ansible_inventories == [expected_inventory] * len(PLAYBOOKS)
 
     # netbird 的 extra vars 只挂在 setup-netbird.yml 上（不是 setup-netbird-agent.yml）。
     # email 取自 Settings（测试 env 里设置的真实地址），不是硬编码的 example.com

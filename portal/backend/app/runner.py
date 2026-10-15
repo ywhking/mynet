@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import tempfile
 import threading
 from datetime import datetime, timezone
@@ -314,19 +315,29 @@ def execute_run(run_id: int, deployer: Deployer, session_factory) -> None:
             out = deployer.terraform_apply(var_file, workdir, env)
             _append_log(run, out, log_parts, db, run_id)
 
-            # spec §8 步骤 4：刷新静态 inventory，否则 ansible 会打到过期/不存在的 hosts.yml
-            # 必须指向本租户的工作目录：inventory 脚本默认按自身位置推导 terraform
-            # 目录（共享的 terraform/），那会读到平台自己的 state 与私钥。
-            _append_log(run, "==> generate_inventory.sh --write", log_parts, db, run_id)
+            # spec §8 步骤 4：刷新静态 inventory，否则 ansible 会打到过期/不存在的 hosts.yml。
+            # 两处都必须按租户隔离：
+            #   * `--terraform-dir`：脚本默认按自身位置推导 terraform 目录（共享的
+            #     `terraform/`），那会读到平台自己的 state 与私钥；
+            #   * `--write <路径>`：否则写进脚本自身目录下的全局 hosts.yml，所有租户共用。
+            # 生成的这份同时作为下面 4 个 playbook 的 `-i`，读写的是同一份。
+            inventory_path = os.path.join(workdir, "hosts.yml")
+            _append_log(run, f"==> generate_inventory.sh --write {inventory_path}", log_parts, db, run_id)
             out = deployer.generate_inventory(
-                settings.inventory_script, settings.ansible_dir, env, terraform_dir=workdir
+                settings.inventory_script,
+                settings.ansible_dir,
+                env,
+                terraform_dir=workdir,
+                out_path=inventory_path,
             )
             _append_log(run, out, log_parts, db, run_id)
 
             for playbook in PLAYBOOKS:
                 extra = _playbook_extra_args(playbook, config, settings)
-                _append_log(run, f"==> ansible-playbook {playbook}", log_parts, db, run_id)
-                out = deployer.run_ansible(playbook, settings.ansible_dir, env, extra)
+                _append_log(run, f"==> ansible-playbook {playbook} -i {inventory_path}", log_parts, db, run_id)
+                out = deployer.run_ansible(
+                    playbook, settings.ansible_dir, env, extra, inventory_path=inventory_path
+                )
                 _append_log(run, out, log_parts, db, run_id)
 
         _finalize_run(run, run_id, "succeeded", None, log_parts, db, deployment=deployment)
@@ -375,11 +386,12 @@ def worker_loop(
       are in-process, so a run whose worker died stays `running` forever and
       blocks the tenant from both retrying and destroying.
 
-    Keep `max_concurrency` at 1. Each tenant now has its own terraform directory
-    (see `prepare_workdir`), but `Settings.ansible_dir` — the cwd every
-    `ansible-playbook` and `generate_inventory.sh` runs in — is still shared, and
-    the inventory it writes is a single global `hosts.yml`. `stop_event` is only
-    used by tests, to shut the loop down.
+    Keep `max_concurrency` at 1. Each tenant has its own terraform directory (see
+    `prepare_workdir`) and its own inventory file inside it, but
+    `Settings.ansible_dir` — the cwd every `ansible-playbook` and
+    `generate_inventory.sh` runs in — is still shared, and it also holds the
+    module every tenant's `.tf` files are copied from. `stop_event` is only used
+    by tests, to shut the loop down.
     """
     validate_runtime_settings(get_settings())
     _demote_orphaned_runs(session_factory)

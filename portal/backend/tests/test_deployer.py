@@ -324,3 +324,41 @@ def test_real_inventory_script_reads_the_terraform_dir_it_is_given(tmp_path):
         assert f"bastion-{name}" in written          # 读的是本目录的 state
         assert f"{tf_dir}/keys" in written           # 私钥也来自本目录
         assert f"bastion.{name}.example.com" in written
+
+
+def test_generate_inventory_writes_to_the_given_out_path(tmp_path, monkeypatch):
+    """Without an out_path the script writes into its OWN directory
+    (`ansible/inventory/hosts.yml`) — one global file every tenant would share."""
+    outfile = tmp_path / "args.txt"
+    script = tmp_path / "generate_inventory.sh"
+    script.write_text(f'#!/bin/sh\necho "$@" > "{outfile}"\n')
+    monkeypatch.chdir(tmp_path)  # a relative out_path would resolve wrongly
+
+    RealDeployer().generate_inventory(str(script), "/tmp", {}, out_path="tenants/acme/hosts.yml")
+
+    recorded = outfile.read_text().strip()
+    assert recorded == f"--write {tmp_path / 'tenants/acme/hosts.yml'}", recorded
+
+
+def test_run_ansible_passes_inventory_override(tmp_path, monkeypatch):
+    """`-i` replaces ansible.cfg's `inventory` setting, so each tenant reads its own file."""
+    fake = tmp_path / "ansible-playbook"
+    _write_exec(str(fake), '#!/bin/sh\necho "$@"\nexit 0\n')
+    monkeypatch.chdir(tmp_path)
+
+    d = RealDeployer(terraform_bin="/bin/echo", ansible_bin=str(fake))
+    out = d.run_ansible("setup-docker.yml", "/tmp", {}, inventory_path="tenants/acme/hosts.yml")
+
+    assert out.strip() == f"-i {tmp_path / 'tenants/acme/hosts.yml'} setup-docker.yml", out
+
+
+def test_run_ansible_without_inventory_uses_the_configured_default(tmp_path):
+    """deploy-all.sh's flow relies on ansible.cfg's default inventory — unchanged."""
+    fake = tmp_path / "ansible-playbook"
+    _write_exec(str(fake), '#!/bin/sh\necho "$@"\nexit 0\n')
+
+    d = RealDeployer(terraform_bin="/bin/echo", ansible_bin=str(fake))
+    out = d.run_ansible("setup-docker.yml", "/tmp", {})
+
+    assert out.strip() == "setup-docker.yml"
+    assert "-i" not in out
