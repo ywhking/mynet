@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..config import get_settings
@@ -35,15 +36,42 @@ def create_deployment(body: DeploymentConfig, user: User = Depends(get_current_u
     if errors:
         raise HTTPException(status_code=400, detail="; ".join(errors))
 
+    # `subdomain` is unique across ALL tenants (the DNS zone is shared), so this
+    # must be a global query, not scoped to `user.tenant_id`. The pre-check
+    # produces the friendly 400 in the common case; the unique index plus the
+    # IntegrityError handler below is what actually makes it safe against a
+    # concurrent registration of the same name.
+    taken = db.query(Deployment).filter(Deployment.subdomain == body.subdomain).first()
+    if taken is not None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"subdomain {body.subdomain!r} is already taken; choose another prefix",
+        )
+
     # One transaction for both rows: a second commit that fails would leave a
     # Deployment with no Run — never executed, and (since nothing else sets the
     # status) permanently invisible at "draft". `Run(deployment=dep)` instead of
     # `deployment_id=dep.id` so the FK resolves from the relationship in the same
     # flush, with no prior commit needed to populate `dep.id`.
-    dep = Deployment(tenant_id=user.tenant_id, config=body.model_dump(), status="draft")
+    dep = Deployment(
+        tenant_id=user.tenant_id,
+        subdomain=body.subdomain,
+        config=body.model_dump(),
+        status="draft",
+    )
     run = Run(deployment=dep, type="create", status="pending")
     db.add_all([dep, run])
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        # Lost the race against another tenant's registration of the same
+        # subdomain. Roll back so the session is usable and report it as the
+        # client error it is — a 500 here would look like a portal outage.
+        db.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail=f"subdomain {body.subdomain!r} is already taken; choose another prefix",
+        )
     return {"id": dep.id, "run_id": run.id, "status": "pending"}
 
 
@@ -51,7 +79,13 @@ def create_deployment(body: DeploymentConfig, user: User = Depends(get_current_u
 def list_deployments(user: User = Depends(get_current_user), db: Session = Depends(get_db)):
     deps = db.query(Deployment).filter(Deployment.tenant_id == user.tenant_id).all()
     return [
-        {"id": d.id, "status": d.status, "config": d.config, "created_at": d.created_at.isoformat()}
+        {
+            "id": d.id,
+            "subdomain": d.subdomain,
+            "status": d.status,
+            "config": d.config,
+            "created_at": d.created_at.isoformat(),
+        }
         for d in deps
     ]
 
@@ -62,6 +96,7 @@ def get_deployment(dep_id: int, user: User = Depends(get_current_user), db: Sess
     runs = db.query(Run).filter(Run.deployment_id == dep.id).all()
     return {
         "id": dep.id,
+        "subdomain": dep.subdomain,
         "config": dep.config,
         "runs": [
             {"id": r.id, "type": r.type, "status": r.status, "error": r.error, "log": r.log}

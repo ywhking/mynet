@@ -24,7 +24,35 @@ def test_generate_tfvars_contains_expected_values():
     assert 'alicloud_region = "cn-wulanchabu"' in out
     assert 'vswitch_zone = "cn-wulanchabu-a"' in out
     assert 'is_bastion = true' in out
-    assert '"bastion"' in out and '"db"' in out
+    # Map keys are slug-prefixed (spec §9) — they become `KEY-<key>` and the ECS
+    # instance name, both of which are account-unique in Alibaba Cloud.
+    assert '"mynet-acme-bastion"' in out
+    assert '"mynet-acme-db"' in out
+    # The tenant-supplied values themselves are passed through untouched.
+    assert 'host_name = "bastion"' in out
+    assert 'domain_name = "bastion"' in out
+
+
+def test_instance_keys_are_unique_across_tenants():
+    """Two tenants picking the same instance names must not collide.
+
+    Regression guard for the `KeyPair.AlreadyExist` failure: the SPA defaults the
+    public list to `bastion,web`, so this is the common path, not an edge case.
+    """
+    out_a = generate_tfvars(_config(), "tenant-a", get_settings())
+    out_b = generate_tfvars(_config(), "tenant-b", get_settings())
+    assert '"mynet-tenant-a-bastion"' in out_a
+    assert '"mynet-tenant-b-bastion"' in out_b
+    assert '"mynet-tenant-b-bastion"' not in out_a
+
+
+def test_instance_type_comes_from_settings_not_the_config():
+    """The ECS size is billed to the platform account, so it is not client input."""
+    s = get_settings()
+    out = generate_tfvars(_config(), "acme", s)
+    assert f'ecs_instance_type = "{s.ecs_instance_type}"' in out
+    # DeploymentConfig no longer has the field at all.
+    assert "ecs_instance_type" not in DeploymentConfig.model_fields
 
 
 def test_generate_tfvars_quotes_values():

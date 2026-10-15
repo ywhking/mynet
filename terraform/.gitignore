@@ -7,6 +7,11 @@
 # Locally generated SSH keys
 keys/
 
+# Per-tenant terraform working directories created by the portal backend
+# (Settings.tenants_dir). Each holds a copy of the module plus one tenant's
+# generated keys/ and state, so it must never be committed.
+.tenants/
+
 # Terraform plan output
 *.plan
 plan.out

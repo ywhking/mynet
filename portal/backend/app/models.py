@@ -39,6 +39,12 @@ class Deployment(Base):
     __tablename__ = "deployments"
     id: Mapped[int] = mapped_column(primary_key=True)
     tenant_id: Mapped[int] = mapped_column(ForeignKey("tenants.id"), index=True)
+    # Globally unique, not per tenant: `tfvars.py` turns it into
+    # `<subdomain>.<platform_domain>` and `terraform/dns.tf` writes an A record
+    # with that name into the single shared DNS zone, so two tenants using the
+    # same prefix create competing records for one hostname. Registration is
+    # fully self-service (spec §4), so nothing else gates it.
+    subdomain: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     config: Mapped[dict] = mapped_column(JSON)
     secrets: Mapped[dict] = mapped_column(JSON, default=dict)
     status: Mapped[str] = mapped_column(String(16), default="draft")

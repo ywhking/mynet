@@ -52,6 +52,76 @@ def test_unauthenticated_rejected(client):
     assert client.get("/api/deployments").status_code == 401
 
 
+def test_second_tenant_same_subdomain_rejected(client):
+    """The DNS zone is shared, so <subdomain>.<platform_domain> is one hostname.
+
+    Registration is self-service (spec §4) with no human gate, so nothing else
+    would stop two tenants from racing for the same A record.
+    """
+    token_a = _register(client, "a@dup.com", "Tenant A")
+    token_b = _register(client, "b@dup.com", "Tenant B")
+
+    first = client.post("/api/deployments", json=_config_body(), headers=_auth(token_a))
+    assert first.status_code == 200
+
+    second = client.post("/api/deployments", json=_config_body(), headers=_auth(token_b))
+    assert second.status_code == 400, second.text
+    assert "subdomain" in second.json()["detail"]
+    assert "taken" in second.json()["detail"]
+
+
+def test_same_tenant_same_subdomain_rejected(client):
+    """Also per tenant: two deployments cannot claim one hostname."""
+    token = _register(client, "same@dup.com")
+    assert client.post("/api/deployments", json=_config_body(), headers=_auth(token)).status_code == 200
+    again = client.post("/api/deployments", json=_config_body(), headers=_auth(token))
+    assert again.status_code == 400
+
+
+def test_different_subdomains_both_accepted(client):
+    """The uniqueness check must not block the normal path."""
+    token_a = _register(client, "a@ok.com", "Tenant A")
+    token_b = _register(client, "b@ok.com", "Tenant B")
+
+    body_a = _config_body()
+    body_a["subdomain"] = "alpha"
+    body_b = _config_body()
+    body_b["subdomain"] = "beta"
+
+    assert client.post("/api/deployments", json=body_a, headers=_auth(token_a)).status_code == 200
+    assert client.post("/api/deployments", json=body_b, headers=_auth(token_b)).status_code == 200
+
+
+def test_subdomain_exposed_in_list_and_detail(client):
+    token = _register(client, "expose@acme.com")
+    dep_id = client.post("/api/deployments", json=_config_body(), headers=_auth(token)).json()["id"]
+
+    listing = client.get("/api/deployments", headers=_auth(token)).json()
+    assert listing[0]["subdomain"] == "acme"
+    detail = client.get(f"/api/deployments/{dep_id}", headers=_auth(token)).json()
+    assert detail["subdomain"] == "acme"
+
+
+def test_client_supplied_instance_type_ignored(client):
+    """spec's #1 named risk: self-service spend on the platform's account.
+
+    `ecs_instance_type` is not part of `DeploymentConfig`, so a client that sends
+    it gets the platform's configured size regardless.
+    """
+    token = _register(client, "spend@acme.com")
+    body = _config_body()
+    body["ecs_instance_type"] = "ecs.gn7i-c8g1.2xlarge"
+    r = client.post("/api/deployments", json=body, headers=_auth(token))
+    assert r.status_code == 200
+
+    db = _db(client)
+    try:
+        stored = db.query(Deployment).all()[0]
+    finally:
+        db.close()
+    assert "ecs_instance_type" not in stored.config
+
+
 def _db(client):
     """The session the app under test is using, via the conftest `get_db` override.
 

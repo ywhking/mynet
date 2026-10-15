@@ -1,9 +1,23 @@
 import threading
 import time
 
+import pytest
+
+from app.config import Settings, get_settings
 from app.deployer import DeployerError
 from app.models import Deployment, Run, Tenant
-from app.runner import PLAYBOOKS, execute_run, worker_loop
+from app.runner import (
+    ORPHAN_ERROR,
+    PLAYBOOKS,
+    _demote_orphaned_runs,
+    execute_run,
+    worker_loop,
+)
+
+NETBIRD = "playbooks/setup-netbird.yml"
+NETBIRD_AGENT = "playbooks/setup-netbird-agent.yml"
+DOCKER = "playbooks/setup-docker.yml"
+NETWORK = "playbooks/setup-network.yml"
 
 
 class FakeDeployer:
@@ -20,18 +34,29 @@ class FakeDeployer:
         self.calls: list[str] = []
         self.ansible_calls: list[tuple[str, list[str]]] = []
         self.apply_count = 0
+        self.workdirs: list[str] = []
 
-    def terraform_apply(self, workspace, var_file, cwd, env):
+    def prepare_workdir(self, source_dir, tenants_dir, slug):
+        self.calls.append("prepare_workdir")
+        path = f"{tenants_dir}/{slug}"
+        self.workdirs.append(path)
+        return path
+
+    def terraform_apply(self, var_file, cwd, env):
         self.calls.append("apply")
         self.apply_count += 1
+        # The cwd the runner chose is load-bearing: it must be the per-tenant
+        # directory, never the shared terraform_dir.
+        assert cwd == self.workdirs[-1], (cwd, self.workdirs)
         if self.fail_on == "apply":
             raise DeployerError("apply failed", "boom")
         if self.raise_on == "apply":
             raise RuntimeError("kaboom")
         return "applied"
 
-    def terraform_destroy(self, workspace, var_file, cwd, env):
+    def terraform_destroy(self, var_file, cwd, env):
         self.calls.append("destroy")
+        assert cwd == self.workdirs[-1], (cwd, self.workdirs)
         return "destroyed"
 
     def generate_inventory(self, script_path, cwd, env):
@@ -48,8 +73,8 @@ def _make_run(db_factory, deployer, run_type="create", slug="acme"):
     db = db_factory()
     t = Tenant(name=slug, slug=slug)
     db.add(t); db.commit()
-    d = Deployment(tenant_id=t.id, config={
-        "subdomain": "acme",
+    d = Deployment(tenant_id=t.id, subdomain=slug, config={
+        "subdomain": slug,
         "public_devices": {"cidr": "172.16.0.0/24", "instances": {
             "bastion": {"host_name": "bastion", "public_ip": True, "is_bastion": True, "domain_name": "bastion"},
         }},
@@ -115,13 +140,13 @@ class _StatusProbeDeployer(FakeDeployer):
         self._dep_id = dep_id
         self.observed: list[str | None] = []
 
-    def terraform_apply(self, workspace, var_file, cwd, env):
+    def terraform_apply(self, var_file, cwd, env):
         db = self._session_factory()
         try:
             self.observed.append(db.query(Deployment).get(self._dep_id).status)
         finally:
             db.close()
-        return super().terraform_apply(workspace, var_file, cwd, env)
+        return super().terraform_apply(var_file, cwd, env)
 
 
 def _extra_args_for(fake, playbook):
@@ -162,14 +187,114 @@ def test_execute_create_marks_succeeded(db_factory):
     first_playbook_index = min(i for i, c in enumerate(fake.calls) if c in PLAYBOOKS)
     assert inventory_index < first_playbook_index, fake.calls
 
-    # netbird email extra var 只挂在 setup-netbird.yml 上（不是 setup-netbird-agent.yml）
-    assert _extra_args_for(fake, "playbooks/setup-netbird.yml") == [
+    # netbird 的 extra vars 只挂在 setup-netbird.yml 上（不是 setup-netbird-agent.yml）。
+    # email 取自 Settings（测试 env 里设置的真实地址），不是硬编码的 example.com
+    # 占位符——那个值会被 playbook 的 assert 直接拒绝。domain 由 bastion 推导。
+    s = get_settings()
+    assert _extra_args_for(fake, NETBIRD) == [
         "-e",
-        "netbird_letsencrypt_email=admin@yourplatform.example.com",
+        f"netbird_domain=bastion.{s.platform_domain}",
+        "-e",
+        f"netbird_letsencrypt_email={s.netbird_letsencrypt_email}",
     ]
-    assert _extra_args_for(fake, "playbooks/setup-netbird-agent.yml") == []
-    assert _extra_args_for(fake, "playbooks/setup-network.yml") == []
-    assert _extra_args_for(fake, "playbooks/setup-docker.yml") == []
+    assert _extra_args_for(fake, NETBIRD_AGENT) == [
+        "-e",
+        f"netbird_management_url=https://bastion.{s.platform_domain}",
+    ]
+    assert _extra_args_for(fake, NETWORK) == []
+    assert _extra_args_for(fake, DOCKER) == []
+
+    # 每个 tenant 都在自己的目录里跑 terraform（共享目录会串 key / state / tfvars）
+    assert fake.workdirs == [f"{s.tenants_dir}/acme"], fake.workdirs
+    assert fake.calls.index("prepare_workdir") < fake.calls.index("apply")
+
+
+def test_terraform_runs_in_the_tenant_workdir(db_factory):
+    """`settings.terraform_dir` is only the source; terraform's cwd is per-tenant."""
+    s = get_settings()
+    fake = FakeDeployer()
+    run_id = _make_run(db_factory, fake, slug="tenant-x")
+    execute_run(run_id, fake, db_factory)
+    # FakeDeployer.terraform_apply asserts cwd == the last prepared workdir, so
+    # this also proves the runner never passes terraform_dir as cwd.
+    assert fake.workdirs == [f"{s.tenants_dir}/tenant-x"]
+    assert s.terraform_dir != fake.workdirs[0]
+
+
+def test_destroy_also_uses_the_tenant_workdir(db_factory):
+    fake = FakeDeployer()
+    run_id = _make_run(db_factory, fake, run_type="destroy", slug="gone")
+    execute_run(run_id, fake, db_factory)
+    assert fake.workdirs == [f"{get_settings().tenants_dir}/gone"]
+
+
+# --- playbook inputs the runner forwards (E) -----------------------------
+
+_PLAYBOOK_SETTINGS = Settings(
+    netbird_letsencrypt_email="ops@mynet.vip",
+    platform_domain="mynet.vip",
+    netbird_package="/opt/netbird-install.tar.gz",
+    netbird_binary="/opt/netbird/netbird",
+    docker_repo_base="https://mirrors.aliyun.com/docker-ce/linux/ubuntu",
+    docker_mirrors="https://docker.m.daocloud.io",
+)
+
+
+def _run_with_settings(db_factory, monkeypatch, settings):
+    monkeypatch.setattr("app.runner.get_settings", lambda: settings)
+    fake = FakeDeployer()
+    run_id = _make_run(db_factory, fake)
+    execute_run(run_id, fake, db_factory)
+    return fake
+
+
+def test_playbook_inputs_go_to_the_right_playbook_only(db_factory, monkeypatch):
+    """The playbooks default to absolute paths on the author's workstation, so
+    the runner must forward the configured values — to that playbook and no
+    other (a leaked `-e` overrides an unrelated playbook's variable)."""
+    fake = _run_with_settings(db_factory, monkeypatch, _PLAYBOOK_SETTINGS)
+
+    assert _extra_args_for(fake, NETBIRD) == [
+        "-e",
+        "netbird_package=/opt/netbird-install.tar.gz",
+        "-e",
+        "netbird_domain=bastion.mynet.vip",
+        "-e",
+        "netbird_letsencrypt_email=ops@mynet.vip",
+    ]
+    assert _extra_args_for(fake, NETBIRD_AGENT) == [
+        "-e",
+        "netbird_binary=/opt/netbird/netbird",
+        "-e",
+        "netbird_management_url=https://bastion.mynet.vip",
+    ]
+    assert _extra_args_for(fake, DOCKER) == [
+        "-e",
+        "docker_repo_base=https://mirrors.aliyun.com/docker-ce/linux/ubuntu",
+        "-e",
+        "docker_mirrors=https://docker.m.daocloud.io",
+    ]
+    assert _extra_args_for(fake, NETWORK) == []
+
+
+def test_optional_playbook_inputs_absent_when_unset(db_factory, monkeypatch):
+    """Unset optional inputs must not be forwarded, so the playbook's own default
+    stays in force. Only the deployment-derived netbird domain/URL and the
+    required email are always sent."""
+    s = Settings(netbird_letsencrypt_email="ops@mynet.vip", platform_domain="mynet.vip")
+    fake = _run_with_settings(db_factory, monkeypatch, s)
+
+    assert _extra_args_for(fake, NETBIRD) == [
+        "-e",
+        "netbird_domain=bastion.mynet.vip",
+        "-e",
+        "netbird_letsencrypt_email=ops@mynet.vip",
+    ]
+    assert _extra_args_for(fake, NETBIRD_AGENT) == [
+        "-e",
+        "netbird_management_url=https://bastion.mynet.vip",
+    ]
+    assert _extra_args_for(fake, DOCKER) == []
 
 
 def test_execute_failure_marks_failed_and_keeps_log(db_factory):
@@ -351,3 +476,84 @@ def test_worker_loop_survives_a_broken_session_factory():
     finally:
         stop.set()
         worker.join(timeout=5.0)
+
+
+# --- orphaned `running` runs (G) -----------------------------------------
+
+def _orphan_run(db_factory, run_id):
+    """Simulate the worker dying mid-run: the row is left at `running`."""
+    db = db_factory()
+    r = db.query(Run).get(run_id)
+    r.status = "running"
+    r.log = "==> terraform apply\n"
+    dep = db.query(Deployment).get(r.deployment_id)
+    dep.status = "running"
+    db.commit()
+    db.close()
+
+
+def test_demote_orphaned_runs_marks_them_failed(db_factory):
+    run_id = _make_run(db_factory, FakeDeployer())
+    _orphan_run(db_factory, run_id)
+
+    assert _demote_orphaned_runs(db_factory) == 1
+
+    r = _get_run(db_factory, run_id)
+    assert r.status == "failed"
+    assert r.error == ORPHAN_ERROR
+    assert r.finished_at is not None
+    # The original output must be kept — it is the only clue about how far the
+    # dead run got — and the recovery must be explained.
+    assert "terraform apply" in r.log
+    assert "recovered on worker startup" in r.log
+    assert _deployment_status(db_factory, run_id) == "failed"
+
+
+def test_demote_orphaned_runs_leaves_other_statuses_alone(db_factory):
+    deployer = FakeDeployer()
+    done = _make_run(db_factory, deployer, slug="done")
+    execute_run(done, deployer, db_factory)  # succeeded
+    pending = _make_run(db_factory, deployer, slug="waiting")  # still pending
+
+    assert _demote_orphaned_runs(db_factory) == 0
+    assert _get_run(db_factory, done).status == "succeeded"
+    assert _get_run(db_factory, pending).status == "pending"
+
+
+def test_worker_loop_demotes_orphans_at_startup(db_factory):
+    """Without this, a dead worker leaves a `running` row that no code path
+    revisits: worker_loop only polls `pending`, destroy refuses while a create is
+    in flight, and create is blocked by the running-count quota."""
+    fake = FakeDeployer()
+    run_id = _make_run(db_factory, fake)
+    _orphan_run(db_factory, run_id)
+
+    stop = threading.Event()
+    worker = threading.Thread(
+        target=worker_loop,
+        args=(db_factory, fake),
+        kwargs={"max_concurrency": 1, "poll_interval": 0.05, "stop_event": stop},
+        daemon=True,
+    )
+    worker.start()
+    try:
+        _wait_for_status(db_factory, run_id, "failed", timeout=10.0)
+        assert fake.calls == [], "an orphaned run must never be executed"
+        # And the tenant is unblocked: a fresh create run is picked up.
+        retry = _add_run(db_factory, _deployment_id_for_run(db_factory, run_id), "create")
+        _wait_for_status(db_factory, retry, "succeeded", timeout=5.0)
+    finally:
+        stop.set()
+        worker.join(timeout=5.0)
+        assert not worker.is_alive()
+
+
+def test_worker_loop_refuses_to_start_with_invalid_settings(db_factory, monkeypatch):
+    """The netbird email is required by the playbook's assert, so a worker without
+    one would fail every deploy after terraform already spent money."""
+    monkeypatch.setattr(
+        "app.runner.get_settings",
+        lambda: Settings(jwt_secret_key="real-secret", netbird_letsencrypt_email=""),
+    )
+    with pytest.raises(RuntimeError):
+        worker_loop(db_factory, FakeDeployer(), stop_event=threading.Event())

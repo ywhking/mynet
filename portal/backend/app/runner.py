@@ -5,7 +5,7 @@ import tempfile
 import threading
 from datetime import datetime, timezone
 
-from .config import get_settings
+from .config import get_settings, validate_runtime_settings
 from .deployer import Deployer, DeployerError
 from .models import Deployment, Run, Tenant
 from .tfvars import generate_tfvars
@@ -23,6 +23,14 @@ PLAYBOOKS = [
 
 # setup-netbird.yml 要求 netbird_letsencrypt_email（见 terraform/deploy-all.sh:162）
 NETBIRD_LETSENCRYPT_VAR = "netbird_letsencrypt_email"
+
+ORPHAN_ERROR = "run was orphaned: the worker stopped while it was still running"
+ORPHAN_LOG = (
+    "==> run recovered on worker startup\n"
+    "The worker process that was executing this run is gone, so it can never "
+    "reach a terminal state on its own. Marked 'failed' so the tenant can retry "
+    "or destroy instead of being stuck forever."
+)
 
 POLL_INTERVAL_SECONDS = 2.0
 
@@ -71,6 +79,104 @@ def _env_for(settings) -> dict[str, str]:
         "ALICLOUD_REGION": settings.alicloud_region,
         "NETBIRD_LETSENCRYPT_EMAIL": settings.netbird_letsencrypt_email,
     }
+
+
+def _netbird_domain(config: DeploymentConfig, settings) -> str:
+    """The bastion's FQDN, i.e. the address NetBird serves from.
+
+    `tfvars.py` writes `domain_name = "<subdomain>.<platform_domain>"` as the DNS
+    *zone* and `terraform/dns.tf` creates one A record per public instance with
+    `rr = <instance domain_name>`, so the bastion resolves at
+    `<bastion.domain_name>.<platform_domain>`.
+    """
+    for inst in config.public_devices.instances.values():
+        if inst.is_bastion and inst.domain_name:
+            return f"{inst.domain_name}.{settings.platform_domain}"
+    return ""
+
+
+def _playbook_extra_args(playbook: str, config: DeploymentConfig, settings) -> list[str]:
+    """The `-e key=value` pairs a playbook needs, mirroring deploy-all.sh.
+
+    The playbooks default several inputs to absolute paths on the author's
+    workstation, so a deploy from anywhere else fails; and `setup-netbird.yml`
+    *requires* a real Let's Encrypt address. Values are only forwarded when
+    non-empty, which leaves the playbook's own default in force otherwise.
+    """
+    args: list[str] = []
+
+    def add(key: str, value: str) -> None:
+        if value:
+            args.extend(["-e", f"{key}={value}"])
+
+    # Note the ordering: `setup-netbird-agent.yml` must be matched before
+    # `setup-netbird.yml` would be — endswith() keeps them distinct today, but
+    # the explicit ordering documents the intent.
+    if playbook.endswith("setup-netbird-agent.yml"):
+        add("netbird_binary", settings.netbird_binary)
+        domain = _netbird_domain(config, settings)
+        add("netbird_management_url", f"https://{domain}" if domain else "")
+    elif playbook.endswith("setup-netbird.yml"):
+        add("netbird_package", settings.netbird_package)
+        add("netbird_domain", _netbird_domain(config, settings))
+        add(NETBIRD_LETSENCRYPT_VAR, settings.netbird_letsencrypt_email)
+    elif playbook.endswith("setup-docker.yml"):
+        add("docker_repo_base", settings.docker_repo_base)
+        add("docker_mirrors", settings.docker_mirrors)
+
+    return args
+
+
+def _demote_orphaned_runs(session_factory) -> int:
+    """Fail every `running` Run left behind by a previous worker process.
+
+    All the other in-flight guards are in-process: `worker_loop` polls `pending`
+    only, destroy refuses while a create is in flight, and create is blocked by
+    the running-count quota. So a worker that dies mid-run leaves a `running` row
+    that no code path ever revisits — the tenant can neither retry nor destroy.
+    There is at most one worker (see `worker_loop`), so any `running` row seen at
+    startup is necessarily an orphan.
+
+    Never raises: a transient DB error here must not stop the worker from
+    starting, and the caller runs it before entering the poll loop.
+    """
+    db = None
+    try:
+        db = session_factory()
+        orphans = db.query(Run).filter(Run.status == "running").all()
+        if not orphans:
+            return 0
+        # Collected before the commit: committing expires the ORM attributes, so
+        # reading them afterwards would re-SELECT every row.
+        summary = [f"run={r.id} deployment={r.deployment_id}" for r in orphans]
+        for run in orphans:
+            run.status = "failed"
+            run.error = ORPHAN_ERROR
+            run.log = (run.log or "") + ("\n" if run.log else "") + ORPHAN_LOG + "\n"
+            run.finished_at = utcnow()
+            # The parent is stuck at "running" for the same reason; "failed" is
+            # what a failed create run would have left, and the destroy endpoint
+            # admits it (unlike "running", which is not terminal for the UI).
+            if run.deployment is not None and run.deployment.status == "running":
+                run.deployment.status = "failed"
+        db.commit()
+        logger.warning(
+            "demoted %d orphaned run(s) to failed at startup: %s",
+            len(summary),
+            ", ".join(summary),
+        )
+        return len(summary)
+    except Exception:  # noqa: BLE001
+        logger.exception("could not demote orphaned runs at startup")
+        if db is not None:
+            _safe_rollback(db, -1)
+        return 0
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:  # noqa: BLE001
+                logger.exception("failed to close session after orphan recovery")
 
 
 def _deployment_terminal_status(run_type: str, status: str) -> str:
@@ -190,14 +296,20 @@ def execute_run(run_id: int, deployer: Deployer, session_factory) -> None:
             f.write(tfvars_content)
             var_file = f.name
 
+        # Per-tenant working directory: `terraform_dir` is only the *source* of
+        # the module. Running in the shared directory would collide the generated
+        # SSH keys (and the state, and any operator terraform.tfvars) between
+        # tenants — see RealDeployer.prepare_workdir.
+        workdir = deployer.prepare_workdir(settings.terraform_dir, settings.tenants_dir, tenant.slug)
+
         env = _env_for(settings)
         if run.type == "destroy":
             _append_log(run, "==> terraform destroy", log_parts, db, run_id)
-            out = deployer.terraform_destroy(tenant.slug, var_file, settings.terraform_dir, env)
+            out = deployer.terraform_destroy(var_file, workdir, env)
             _append_log(run, out, log_parts, db, run_id)
         else:
             _append_log(run, "==> terraform apply", log_parts, db, run_id)
-            out = deployer.terraform_apply(tenant.slug, var_file, settings.terraform_dir, env)
+            out = deployer.terraform_apply(var_file, workdir, env)
             _append_log(run, out, log_parts, db, run_id)
 
             # spec §8 步骤 4：刷新静态 inventory，否则 ansible 会打到过期/不存在的 hosts.yml
@@ -206,9 +318,7 @@ def execute_run(run_id: int, deployer: Deployer, session_factory) -> None:
             _append_log(run, out, log_parts, db, run_id)
 
             for playbook in PLAYBOOKS:
-                extra: list[str] = []
-                if playbook.endswith("setup-netbird.yml"):
-                    extra = ["-e", f"{NETBIRD_LETSENCRYPT_VAR}={settings.netbird_letsencrypt_email}"]
+                extra = _playbook_extra_args(playbook, config, settings)
                 _append_log(run, f"==> ansible-playbook {playbook}", log_parts, db, run_id)
                 out = deployer.run_ansible(playbook, settings.ansible_dir, env, extra)
                 _append_log(run, out, log_parts, db, run_id)
@@ -250,11 +360,24 @@ def worker_loop(
 ) -> None:
     """Poll for pending runs forever, dispatching at most `max_concurrency` at a time.
 
-    Keep `max_concurrency` at 1: every deployment shares one terraform directory
-    (`Settings.terraform_dir`) and `terraform workspace select` writes state for the
-    whole directory, so two concurrent runs can apply tenant A's plan under tenant
-    B's workspace. `stop_event` is only used by tests, to shut the loop down.
+    Two things happen once, before the loop:
+
+    * settings are validated, so a misconfigured worker (publicly known JWT
+      secret, placeholder netbird email) dies immediately instead of after
+      provisioning half a tenant's infrastructure;
+    * every `running` run is demoted to `failed`. All the other in-flight guards
+      are in-process, so a run whose worker died stays `running` forever and
+      blocks the tenant from both retrying and destroying.
+
+    Keep `max_concurrency` at 1. Each tenant now has its own terraform directory
+    (see `prepare_workdir`), but `Settings.ansible_dir` — the cwd every
+    `ansible-playbook` and `generate_inventory.sh` runs in — is still shared, and
+    the inventory it writes is a single global `hosts.yml`. `stop_event` is only
+    used by tests, to shut the loop down.
     """
+    validate_runtime_settings(get_settings())
+    _demote_orphaned_runs(session_factory)
+
     _stop = stop_event if stop_event is not None else threading.Event()
     semaphore = threading.Semaphore(max_concurrency)
     active: set[int] = set()

@@ -17,9 +17,6 @@ class TokenResponse(BaseModel):
     token_type: str = "bearer"
 
 
-from typing import Literal
-
-
 class PublicInstance(BaseModel):
     host_name: str
     domain_name: str
@@ -46,4 +43,7 @@ class DeploymentConfig(BaseModel):
     public_devices: PublicDevices
     internal_devices: InternalDevices
     vpc_cidr: str = "172.16.0.0/16"
-    ecs_instance_type: str = "ecs.t6-c1m2.large"
+    # No `ecs_instance_type`: the instance size is billed to the platform's
+    # Alibaba Cloud account, so it comes from Settings, never from the request.
+    # (Extra keys in the body are ignored by pydantic, so a client trying to set
+    # it anyway has no effect.)
