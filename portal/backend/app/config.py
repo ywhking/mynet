@@ -12,9 +12,12 @@ class Settings(BaseSettings):
     alicloud_region: str = "cn-wulanchabu"
     vswitch_zone: str = "cn-wulanchabu-a"
 
-    terraform_dir: str = "../terraform"
-    ansible_dir: str = "../terraform/ansible"
-    inventory_script: str = "../terraform/ansible/inventory/generate_inventory.sh"
+    # Relative to the documented launch cwd: `cd portal/backend && uvicorn app.main:app`
+    # (see the Task 10 README), where the repo root sits two levels up.
+    terraform_dir: str = "../../terraform"
+    ansible_dir: str = "../../terraform/ansible"
+    # Relative to ansible_dir (the cwd the playbooks and inventory script run in).
+    inventory_script: str = "inventory/generate_inventory.sh"
 
     alicloud_access_key: str = ""
     alicloud_secret_key: str = ""

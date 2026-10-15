@@ -75,6 +75,27 @@ def test_generate_inventory_runs_script_with_write(tmp_path):
     assert outfile.read_text().strip() == "--write"
 
 
+def test_generate_inventory_resolves_relative_script_independently_of_cwd(tmp_path, monkeypatch):
+    """`Settings.inventory_script` is relative to the ansible dir, i.e. to the `cwd` we pass.
+
+    The script has to run although the process cwd is elsewhere — and although `cwd`
+    is itself relative, which a plain ``os.path.join`` does not cover: bash would
+    re-resolve the still-relative joined path against the child's cwd and fail.
+    """
+    ansible_dir = tmp_path / "sub" / "ansible"
+    (ansible_dir / "inventory").mkdir(parents=True)
+    marker = tmp_path / "ran.txt"
+    (ansible_dir / "inventory" / "generate_inventory.sh").write_text(
+        f'#!/bin/sh\necho "$@" > "{marker}"\n'
+    )
+    monkeypatch.chdir(tmp_path)  # neither ansible_dir nor its parent
+
+    d = RealDeployer()
+    d.generate_inventory("inventory/generate_inventory.sh", "sub/ansible", {})
+
+    assert marker.read_text().strip() == "--write"
+
+
 def test_run_ansible_passes_extra_args(tmp_path):
     fake = tmp_path / "ansible-playbook"
     _write_exec(str(fake), '#!/bin/sh\necho "$@"\nexit 0\n')

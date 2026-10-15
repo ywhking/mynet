@@ -80,7 +80,17 @@ class RealDeployer:
         )
 
     def generate_inventory(self, script_path: str, cwd: str, env: dict[str, str]) -> str:
-        return self._run(["bash", script_path, "--write"], cwd, env)
+        # bash resolves a relative script argument against the *child's* cwd, which
+        # subprocess sets to `cwd`. Passing a cwd-relative script_path straight through
+        # would therefore have it re-resolved against `cwd` a second time
+        # (cwd/cwd/script) — the doubled path of the original bug. Resolve to an
+        # absolute path so the child's cwd cannot influence it at all: a plain join is
+        # not enough, because with a relative `cwd` (e.g. "../../terraform/ansible")
+        # the joined path is still relative and gets re-resolved the same way.
+        import os
+
+        path = script_path if os.path.isabs(script_path) else os.path.abspath(os.path.join(cwd, script_path))
+        return self._run(["bash", path, "--write"], cwd, env)
 
     def run_ansible(
         self, playbook: str, cwd: str, env: dict[str, str], extra_args: list[str] | None = None
